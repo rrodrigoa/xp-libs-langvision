@@ -6,7 +6,8 @@ dependency. The extraction baseline is StreamSQL commit `2a03048`.
 
 ## Run locally
 
-With Node.js 24 installed, run these commands from this directory:
+With Node.js 24 installed, run these commands from the `standalone/` directory.
+If you are in the repository root instead, use `npm run setup` and `npm start`.
 
 ```sh
 npm ci

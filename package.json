@@ -1,0 +1,10 @@
+{
+  "name": "langvision",
+  "private": true,
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "setup": "npm --prefix standalone ci && npm --prefix standalone run build",
+    "start": "npm --prefix standalone start",
+    "test": "npm --prefix standalone test"
+  }
+}

@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -12,6 +13,11 @@ import { mcpConnections, refreshMcpConnection, saveMcpConnection } from './assis
 import { exportAgentPackage, importAgentPackage } from './agentPackage.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
+const dist = path.join(root, 'dist');
+if (!statSync(path.join(dist, 'index.html'), { throwIfNoEntry: false })?.isFile()) {
+  console.error('LangVision UI is not built. Run npm run setup from the repository root, or npm ci and npm run build from standalone/.');
+  process.exit(1);
+}
 const port = Number(process.env.PORT ?? 8780);
 const host = process.env.LANGVISION_BIND ?? '127.0.0.1';
 const password = process.env.LANGVISION_OPERATOR_PASSWORD;
@@ -63,5 +69,5 @@ app.get('/api/agent-packages/:id', wrap(async (req, res) => {
 app.post('/api/agent-packages', wrap(async (req, res) => res.status(201).json(importAgentPackage(req.body))));
 app.use('/api/assistant', createAssistantRouter({ agent, fetchImpl, serviceBaseUrl }));
 app.use('/api/assistant', createAssistantDesignRouter({ agent, contextBroker, fetchImpl, serviceBaseUrl }));
-app.use(express.static(path.resolve(root, 'dist')));
+app.use(express.static(dist));
 app.listen(port, host, () => console.log('LangVision listening on ' + host + ':' + port));
