@@ -1,0 +1,11 @@
+{
+  "name": "langvision",
+  "private": true,
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "setup": "node standalone/scripts/setup.mjs",
+    "launch": "npm run setup && npm start",
+    "start": "npm --prefix standalone start",
+    "test": "npm --prefix standalone test"
+  }
+}
