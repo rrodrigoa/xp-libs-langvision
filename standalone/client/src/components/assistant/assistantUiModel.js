@@ -53,6 +53,7 @@ export function assistantConversationItems(conversation) {
           actionId: call.id,
           toolName: call.name,
           status: call.status ?? "requested",
+          error: call.status === 'failed' ? call.error : undefined,
           explanation: call.preview?.summary ?? readableToolName(call.name)
         };
       });

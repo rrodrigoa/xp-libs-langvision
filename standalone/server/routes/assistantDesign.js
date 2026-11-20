@@ -11,6 +11,7 @@ import { rawDebugEnabled,listDebugArtifacts,readDebugArtifact,inspectDebugArtifa
 import { listAssistantWorkflowDrafts, saveAssistantWorkflowDraft, publishAssistantWorkflowDraft } from '../assistantStore.js';
 import { PRIMITIVE_TYPES, PRIMITIVE_PRESETS, blankPrimitiveAgent, resolvePrimitiveBinding, primitiveActions, primitiveWorkflows, validatePrimitiveAgent } from '../../shared/primitiveAgentModel.js';
 import { starterPrimitiveAgent } from '../../shared/primitiveAgentStarter.js';
+import { addApproachPlanning, migrateInstructionSkills } from '../../shared/codingAgent.js';
 import { PRIMITIVE_REGISTERED_TOOLS } from '../primitiveAgentAdapters.js';
 import { migratePrimitiveNative } from '../../shared/primitiveNativeMigration.js';
 import { nativeModelMessages, nativeFinishTool } from '../../shared/primitiveNativeProtocol.js';
@@ -39,6 +40,22 @@ export function createAssistantDesignRouter({ agent, contextBroker, fetchImpl = 
     }
   };
   router.get('/node-types', wrap((_request, response) => response.json({ version: 5, types: PRIMITIVE_TYPES, presets: PRIMITIVE_PRESETS })));
+  router.post('/workflows/:id/coding-planning-draft', wrap((request, response) => {
+    const id = request.params.id;
+    if (id !== 'langvision-coding-agent') throw new Error('Only the built-in Coding Agent has a planning upgrade.');
+    const saved = listAssistantWorkflows().find(item => item.id === id);
+    const draft = listAssistantWorkflowDrafts().find(item => item.id === id);
+    if (!saved || (draft?.draftVersion ?? 0) !== request.body.expectedDraftVersion || saved.version !== request.body.expectedVersion) {
+      throw Object.assign(new Error('Reload the latest Coding Agent before upgrading it.'), { status: 409 });
+    }
+    const definition = structuredClone(draft?.definition ?? saved.definition);
+    if (!addApproachPlanning(definition)) throw new Error('The draft already has approach planning or its existing stage links no longer match the built-in graph.');
+    migrateInstructionSkills(definition);
+    draftShape(definition);
+    const diagnostics = validatePrimitiveAgent(definition);
+    if (diagnostics.length) throw new Error(diagnostics.join('\n'));
+    response.json({ ...saveAssistantWorkflowDraft(id, definition, draft?.draftVersion ?? 0), version: saved.version });
+  }));
   router.post('/workflows/:id/native-draft', wrap((request, response) => {
     const draft = listAssistantWorkflowDrafts().find(item => item.id === request.params.id);
     if ((draft?.draftVersion ?? 0) !== request.body.expectedDraftVersion) throw Object.assign(new Error('Reload the latest draft before migrating.'), { status: 409 });
@@ -155,7 +172,8 @@ export function createAssistantDesignRouter({ agent, contextBroker, fetchImpl = 
       if (node.handler === 'llm' && node.operationVersion === 2) {
         const settings = node.settings;
         const context = settings.context ? resolvePrimitiveBinding(settings.context, request.body.sampleState ?? {}) : undefined;
-        return response.json({ nodeId: node.id, input, messages: nativeModelMessages({ ...settings, input, context, workflow, node }), tools: [...[...ASSISTANT_CAPABILITIES, ...PRIMITIVE_REGISTERED_TOOLS].filter(tool => settings.toolNames.includes(tool.name)).map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.schema } })), nativeFinishTool(workflow, node)] });
+        const instructionSkills = (settings.instructionSkillIds ?? []).map(id => workflow.resources?.skills?.find(skill => skill.id === id)).filter(Boolean);
+        return response.json({ nodeId: node.id, input, messages: nativeModelMessages({ ...settings, input, context, workflow, node, instructionSkills }), tools: [...[...ASSISTANT_CAPABILITIES, ...PRIMITIVE_REGISTERED_TOOLS].filter(tool => settings.toolNames.includes(tool.name)).map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.schema } })), ...[nativeFinishTool(workflow, node, { input, context })].filter(Boolean)] });
       }
       return response.json({ nodeId: node.id, input, ...(node.handler === 'llm' ? { messages: [{ role: 'system', content: node.settings.systemPrompt }, { role: 'user', content: JSON.stringify({ input, ...(node.settings.actionPath ? { availableActions: actions } : {}) }) }], toolNames: node.settings.toolNames, responseSchema: node.settings.responseSchema } : {}), actions });
     }

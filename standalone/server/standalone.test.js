@@ -10,13 +10,271 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
-import { __setAssistantDbForTests, activeAssistantWorkflow, closeAssistantStore, createConversation, listAssistantWorkflowDrafts, saveAssistantWorkflow, saveAiProfile, selectAssistantWorkflow } from './assistantStore.js';
+import { __setAssistantDbForTests, activeAssistantWorkflow, assistantDebugDatabase, closeAssistantStore, createConversation, listAssistantWorkflowDrafts, saveAssistantWorkflow, saveAiProfile, selectAssistantWorkflow } from './assistantStore.js';
 import { starterPrimitiveAgent } from '../shared/primitiveAgentStarter.js';
 import { ASSISTANT_CAPABILITIES, capabilityByName, mcpConnections, refreshMcpConnection, saveMcpConnection } from './assistantCapabilities.js';
 import { AssistantLangGraphRuntime } from './assistantGraph.js';
 import { ConsiliumToolHost } from './assistantAgent.js';
 import { exportAgentPackage, importAgentPackage } from './agentPackage.js';
-import { localModelGateway } from './modelGateway.js';
+import { boundedOllamaOptions, localModelGateway } from './modelGateway.js';
+import { provisionLocalCodingAgent, getAiProfile, deleteAiProfile } from './assistantStore.js';
+import { CODE_CHANGES_TOOL, recordAppliedCodeChange, validateCodeChangeSnapshot } from '../shared/agentExperience.js';
+import { availableNativeExits, nativeFinishTool, nativeModelMessages, validateNativeFinish } from '../shared/primitiveNativeProtocol.js';
+import { addTerminalCodingTools, codingAgent } from '../shared/codingAgent.js';
+import { invokeGraphModel } from './assistantModelInvocation.js';
+import { validatePrimitiveAgent } from '../shared/primitiveAgentModel.js';
+
+test('native model requests use one leading system message and retain ordered tool history', () => {
+  const node = { id: 'reason', settings: { progressInstructions: 'progress', authoringInstructions: 'style', researchInstructions: 'research', toolContractInstructions: 'tools' } };
+  const transcript = [{ role: 'assistant', content: '', tool_calls: [{ id: 'call' }] }, { role: 'tool', tool_call_id: 'call', content: 'result' }];
+  const messages = nativeModelMessages({ node, workflow: { edges: [] }, systemPrompt: 'base', input: {}, transcript });
+  assert.deepEqual(messages.map(message => message.role), ['system', 'user', 'assistant', 'tool']);
+  assert.equal(messages[0].content, 'base\n\nprogress\n\nstyle\n\nresearch\n\ntools');
+  assert.deepEqual(messages.slice(-2), transcript);
+  for (const llm of codingAgent().nodes.filter(item => item.handler === 'llm')) {
+    assert.doesNotMatch(JSON.stringify(llm.settings), /ChronusQL|language\.search|figura\.create_panel|update SQL/i);
+  }
+});
+
+test('a node may inherit, opt out, or reference only valid saved skill IDs', () => {
+  const graph = codingAgent();
+  const reason = graph.nodes.find(node => node.id === 'reason');
+  delete reason.settings.instructionSkillIds;
+  for (const ids of [undefined, [], ['safe-project-edits']]) {
+    reason.settings.skillIds = ids;
+    assert.deepEqual(validatePrimitiveAgent(graph), []);
+  }
+  reason.settings.skillIds = ['missing'];
+  assert.ok(validatePrimitiveAgent(graph).some(error => /saved resources/.test(error)));
+});
+
+test('the approach exposes only exits supported by its bindings and cannot replace evidence with a chat update', () => {
+  const graph = codingAgent();
+  const node = graph.nodes.find(item => item.id === 'approach');
+  const before = { input: { saved: {} } };
+  const after = { input: { saved: { codingInspection: {} } } };
+  const result = { question: 'Which target?', reason: 'The choice changes deployment.' };
+  const ask = { arguments: { exit: 'ask_user', result, evidenceReferences: ['observation'] } };
+  assert.deepEqual(nativeFinishTool(graph, node, before).function.parameters.properties.exit.enum, ['inspect_workspace']);
+  assert.deepEqual(availableNativeExits(graph, node, after).map(edge => edge.id), ['ask_user', 'approach_ready']);
+  assert.throws(() => validateNativeFinish(ask, graph, node, [], before), /allowed values/);
+  assert.throws(() => validateNativeFinish(ask, graph, node, [{ requestId: 'observation', name: 'agent.report_status', success: true }], after), /authoritative evidence/);
+  assert.equal(validateNativeFinish(ask, graph, node, [{ requestId: 'observation', name: 'workspace.list', success: true, result: { targetPlatform: 'win32' } }], after).id, 'ask_user');
+});
+
+test('an authoritative edit receipt advances only the exact active change without needing a model replay', () => {
+  const changes = [{ id: 'first', title: 'Add source', status: 'active' }, { id: 'second', title: 'Add test', status: 'pending' }];
+  assert.equal(recordAppliedCodeChange(changes, 'second', 'edit-1'), null);
+  const applied = recordAppliedCodeChange(changes, 'first', 'edit-1');
+  assert.deepEqual(applied.map(change => change.status), ['completed', 'active']);
+  assert.equal(applied[0].evidenceReference, 'edit-1');
+  assert.equal(recordAppliedCodeChange(applied, 'first', 'edit-1'), null);
+  assert.doesNotThrow(() => validateCodeChangeSnapshot(applied, applied, [
+    { name: 'workspace.edit', requestId: 'edit-1', success: true, appliedCodeChanges: applied },
+  ]));
+});
+
+test('a non-model node can publish a bound chat status with its Historia attempt identity', async () => {
+  const checkpoint = new Database(':memory:');
+  __setAssistantDbForTests(new Database(':memory:'));
+  try {
+    const definition = starterPrimitiveAgent('Status smoke');
+    delete definition.executionWorkflow;
+    const receive = definition.nodes.find(node => node.id === 'receive');
+    const respond = definition.nodes.find(node => node.id === 'respond');
+    receive.settings.statusMessages = { start: { value: 'The workflow received the request.' } };
+    respond.settings.input = { fields: { answerMarkdown: { path: 'entry.request' } } };
+    definition.nodes = [receive, respond];
+    definition.edges = [{ id: 'continue', name: 'Finish', source: receive.id, target: respond.id }];
+    saveAssistantWorkflow('status-smoke', definition, 0);
+    selectAssistantWorkflow('default', 'status-smoke');
+    const runtime = new AssistantLangGraphRuntime({ toolHost: new ConsiliumToolHost({}), checkpointer: new SqliteSaver(checkpoint) });
+    const conversation = createConversation({ workspaceId: 'default', surface: 'ai' });
+    const result = await runtime.submit({ conversationId: conversation.id, content: 'Verification complete.', surface: 'ai' });
+    const statuses = result.messages.filter(msg => msg.payload?.messageKind === 'node-status');
+    assert.equal(statuses.length, 1);
+    assert.equal(statuses[0].content, 'The workflow received the request.');
+    assert.equal(statuses[0].payload.nodeId, 'receive');
+    assert.ok(statuses[0].payload.nodeExecutionId);
+    assert.ok(result.messages.some(msg => msg.payload?.finalAnswer && msg.content === 'Verification complete.'));
+  } finally { checkpoint.close(); closeAssistantStore(); }
+});
+
+test('one completion action accepts fresh Linux or matching Windows evidence without requiring a prose summary', () => {
+  const workflow = codingAgent();
+  addTerminalCodingTools(workflow);
+  assert.deepEqual(validatePrimitiveAgent(workflow), []);
+  const verify = workflow.nodes.find(node => node.id === 'verify');
+  const tool = (requestId, name, result) => ({ requestId, name, success: true, result });
+  const edit = tool('edit', 'workspace.edit', { path: 'GitPrompt.ps1' });
+  const wait = tool('wait', 'terminal.wait_for', { session_id: 'win', source: 'screen', matched_text: '[repo, main] [up0, down0, =0]>' });
+  const screen = tool('screen', 'terminal.get_screen', { session_id: 'win', current_line: wait.result.matched_text });
+  const close = tool('close', 'terminal.close', { session_id: 'win', state: 'closed', discarded: false });
+  const linux = tool('linux', 'workspace.run', { verified: true });
+  const finish = (observations, evidenceReferences) => validateNativeFinish({ arguments: { exit: 'answer', result: { answerMarkdown: 'Verified.' }, evidenceReferences } }, workflow, verify, observations);
+  assert.equal(finish([edit, wait, screen, close], ['wait', 'screen', 'close']).id, 'answer');
+  assert.equal(finish([edit, linux], ['linux']).id, 'answer');
+  assert.equal(finish([edit, wait, screen, close], [{ requestId: 'wait', name: 'terminal.wait_for' }, 'screen', 'close']).id, 'answer');
+  assert.throws(() => finish([edit, wait, screen, close], [{ requestId: 'wait', toolCallId: 'invented' }, 'screen', 'close']), /does not match/);
+  assert.throws(() => finish([edit, wait, screen, { ...close, result: { ...close.result, discarded: true } }], ['wait', 'screen', 'close']), /discarded/);
+  assert.throws(() => finish([edit, wait, screen, close], ['screen', 'close']), /Windows terminal verification.*terminal.wait_for/);
+  assert.throws(() => finish([edit, wait, { ...screen, result: { ...screen.result, current_line: 'PS>' } }, close], ['wait', 'screen', 'close']), /current_line/);
+  assert.throws(() => finish([edit, wait, screen, { ...close, result: { ...close.result, session_id: 'other' } }], ['wait', 'screen', 'close']), /session_id/);
+  assert.throws(() => finish([linux, edit], ['linux']), /Linux behavior tests/);
+  assert.throws(() => finish([wait, screen, close, edit], ['wait', 'screen', 'close']), /Windows terminal verification.*terminal.wait_for/);
+});
+
+test('split nested Ollama template errors are classified without leaking provider diagnostics', async () => {
+  const { server, url } = await listen((_req, res) => {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.write('{"error":{"message":"Jinja Exception: ');
+    setTimeout(() => res.end('System message must be at the beginning. private path"}}'), 10);
+  });
+  try {
+    const response = await localModelGateway('http://langvision.local/api/ai/chat', { body: JSON.stringify({ baseAddress: url, model: 'fixture', messages: [] }) });
+    const failure = await response.json();
+    assert.equal(failure.code, 'model_template');
+    assert.doesNotMatch(failure.error, /private path/);
+  } finally { await close(server); }
+});
+
+test('the configured Ollama limit caps only local context and never raises a smaller request', () => {
+  const env = { LANGVISION_LOCAL_OLLAMA_CONTEXT: '8192' };
+  const options = { num_ctx: 16384, temperature: 0 };
+  assert.deepEqual(boundedOllamaOptions('http://localhost:11434', options, env), { num_ctx: 8192, temperature: 0 });
+  assert.equal(boundedOllamaOptions('http://127.0.0.1:11434', { num_ctx: 4096 }, env).num_ctx, 4096);
+  assert.equal(boundedOllamaOptions('http://remote.example', options, env), options);
+  assert.equal(boundedOllamaOptions('http://localhost', options, { LANGVISION_LOCAL_OLLAMA_CONTEXT: '0' }), options);
+});
+
+test('model response timing is controlled by the configured deadline', async () => {
+  const { server, url } = await listen((_request, response) => {
+    setTimeout(() => {
+      if (!response.destroyed) response.end(JSON.stringify({ message: { content: 'slow answer' } }));
+    }, 125);
+  });
+  const nodeId = 'slow';
+  const invoke = timeoutMs => invokeGraphModel({ fetchImpl: localModelGateway, serviceBaseUrl: url,
+    workflow: { nodes: [{ id: nodeId }] }, nodeId,
+    profile: { model: 'fixture', timeoutMs }, body: { baseAddress: url, model: 'fixture', messages: [] } });
+  try {
+    await assert.rejects(invoke(30), { primitiveProviderFailure: true, message: /exceeded.*request timeout/ });
+    const result = await (await invoke(2000)).json();
+    assert.equal(result.message.content, 'slow answer');
+  } finally { await close(server); }
+});
+
+test('a terminal provider transport error fails the turn instead of reentering its model node', async () => {
+  __setAssistantDbForTests(new Database(':memory:'));
+  const checkpoint = new Database(':memory:');
+  try {
+    const graph = starterPrimitiveAgent('Transport failure');
+    graph.profileId = saveAiProfile({ displayName: 'Transport fixture', baseUrl: 'http://fixture', model: 'fixture' }).id;
+    saveAssistantWorkflow('transport', graph, 0);
+    selectAssistantWorkflow('transport-test', 'transport');
+    const { id } = createConversation({ workspaceId: 'transport-test', surface: 'ai' });
+    let requests = 0;
+    const options = { contextBroker: {}, serviceBaseUrl: 'http://fixture', fetchImpl: async () => {
+      requests++;
+      return Response.json({ code: 'model_transport', error: 'Provider socket closed.' }, { status: 502 });
+    } };
+    const runtime = new AssistantLangGraphRuntime({ ...options, toolHost: new ConsiliumToolHost(options), checkpointer: new SqliteSaver(checkpoint) });
+    const result = await runtime.submit({ conversationId: id, content: 'Submit once.', surface: 'ai', context: {} });
+    assert.equal(result.state, 'failed');
+    assert.match(result.messages.at(-1).content, /Provider socket closed/);
+    assert.equal(requests, 1);
+  } finally { checkpoint.close(); closeAssistantStore(); }
+});
+
+test('local startup migrates the legacy default but preserves explicitly selected custom agents', () => {
+  __setAssistantDbForTests(new Database(':memory:'));
+  try {
+    selectAssistantWorkflow('default', activeAssistantWorkflow().id);
+    provisionLocalCodingAgent({ LANGVISION_CODER_MODEL: 'fixture-coder' });
+    const active = activeAssistantWorkflow();
+    assert.equal(active.id, 'langvision-coding-agent');
+    assert.equal(getAiProfile(active.definition.profileId).displayName, 'Default');
+    assert.equal(getAiProfile(active.definition.profileId).thinkingMode, 'medium');
+    assert.equal(getAiProfile(active.definition.nodes.find(node => node.id === 'reason').settings.profileId).model, 'fixture-coder');
+    assert.throws(() => saveAiProfile({ displayName: ' default ' }), /reserved/);
+    assert.throws(() => deleteAiProfile(active.definition.profileId), /Default/i);
+    assert.equal(active.definition.nodes.find(node => node.id === 'plan_changes').settings.profileId, active.definition.profileId);
+    assert.ok(active.definition.resources.skills.some(skill => skill.id === 'safe-project-edits'));
+    assert.ok(active.definition.resources.skills.some(skill => skill.title === 'Authoring guidance'));
+    saveAssistantWorkflow('custom', starterPrimitiveAgent('Custom'), 0);
+    selectAssistantWorkflow('default', 'custom');
+    provisionLocalCodingAgent({});
+    assert.equal(activeAssistantWorkflow().id, 'custom');
+    assert.equal(getAiProfile('langvision-default-code').model, 'fixture-coder');
+  } finally { closeAssistantStore(); }
+});
+
+test('the code change snapshot advances one edit at a time with matching evidence', () => {
+  const first = { id: 'source', title: 'Update source', status: 'active' };
+  const second = { id: 'tests', title: 'Add tests', status: 'pending' };
+  const original = [first, second];
+  const completed = { ...first, status: 'completed', evidenceReference: 'edit-1' };
+  const next = [completed, { ...second, status: 'active' }];
+  const observations = [{ name: CODE_CHANGES_TOOL, success: true }, { name: 'workspace.edit', requestId: 'edit-1', success: true }];
+  assert.doesNotThrow(() => validateCodeChangeSnapshot(original));
+  assert.doesNotThrow(() => validateCodeChangeSnapshot(next, original, observations));
+  assert.throws(() => validateCodeChangeSnapshot(next, original), /successful workspace.edit/);
+  assert.throws(() => validateCodeChangeSnapshot([{ ...second, status: 'completed', evidenceReference: 'edit-1' }], original, observations), /only the active change/);
+  assert.throws(() => validateCodeChangeSnapshot([second, first]), /first remaining change/);
+  assert.throws(() => validateCodeChangeSnapshot([next[1]], next), /Keep completed changes/);
+});
+
+test('the terminal migration upgrades the default Coding Agent once without modifying historical revisions', () => {
+  __setAssistantDbForTests(new Database(':memory:'));
+  try {
+    provisionLocalCodingAgent({});
+    const original = activeAssistantWorkflow();
+    assert.ok(!original.definition.edges.some(edge => edge.id === 'terminal_answer'));
+    provisionLocalCodingAgent({}, { terminal: true });
+    const updated = activeAssistantWorkflow();
+    assert.equal(updated.id, original.id);
+    assert.ok(updated.version > original.version);
+    assert.ok(updated.definition.edges.some(edge => edge.id === 'interactive_terminal'));
+    assert.ok(updated.definition.edges.some(edge => edge.id === 'terminal_answer'));
+    assert.equal(updated.definition.edges.find(edge => edge.id === 'answer' && edge.source === 'verify').evidenceAlternatives.length, 2);
+    assert.ok(updated.definition.nodes.find(node => node.id === 'verify_tools').settings.toolNames.includes('terminal.get_screen'));
+    assert.equal(updated.definition.nodes.find(node => node.id === 'tools').settings.toolNames.filter(name => name.startsWith('terminal.')).length, 8);
+    assert.ok(!original.definition.nodes.find(node => node.id === 'tools').settings.toolNames.includes('terminal.open'));
+    provisionLocalCodingAgent({}, { terminal: true });
+    assert.equal(activeAssistantWorkflow().version, updated.version);
+  } finally { closeAssistantStore(); }
+});
+
+test('the agent can reorder its checklist and remove an out-of-scope task in one update', async () => {
+  __setAssistantDbForTests(new Database(':memory:'));
+  const checkpoint = new Database(':memory:');
+  try {
+    const profile = saveAiProfile({ displayName: 'Checklist fixture', baseUrl: 'http://fixture', model: 'fixture' });
+    const definition = starterPrimitiveAgent('Checklist fixture', { tools: [{ name: 'agent.report_progress' }] });
+    definition.profileId = profile.id;
+    saveAssistantWorkflow('checklist-fixture', definition, 0);
+    selectAssistantWorkflow('checklist-test', 'checklist-fixture');
+    const conversation = createConversation({ workspaceId: 'checklist-test', surface: 'ai' });
+    const first = { id: 'first', title: 'First', status: 'pending' };
+    const second = { id: 'second', title: 'Second', status: 'pending' };
+    const extra = { id: 'extra', title: 'Unrequested lint pass', status: 'pending' };
+    let step = 0;
+    const options = { contextBroker: {}, serviceBaseUrl: 'http://fixture', fetchImpl: async () => {
+      const arguments_ = step === 0 ? { summary: 'Plan', tasks: [first, second, extra] }
+        : { summary: 'Adjusted plan', tasks: [{ ...second, status: 'active' }, first], planChangeReason: 'Lint is out of scope.', currentTaskId: 'extra' };
+      const call = step < 2 ? { name: 'agent.report_progress', arguments: arguments_ } : {
+        name: 'finish_step', arguments: { exit: 'answer', result: { answerMarkdown: 'Finished.' }, evidenceReferences: [], summary: 'Finished' }
+      };
+      if (++step > 3) throw new Error('Stop fixture after two plans.');
+      return Response.json({ message: { tool_calls: [{ id: 'checklist-' + step, function: call }] } });
+    } };
+    const runtime = new AssistantLangGraphRuntime({ ...options, toolHost: new ConsiliumToolHost(options), checkpointer: new SqliteSaver(checkpoint) });
+    const result = await runtime.submit({ conversationId: conversation.id, content: 'Update my checklist.', surface: 'ai', context: {} });
+    const turn = result.turns.at(-1);
+    assert.deepEqual(turn.tasks.map(task => [task.title, task.status]), [['Second', 'active'], ['First', 'pending'], ['Unrequested lint pass', 'removed']]);
+    assert.equal(turn.currentTaskId, turn.tasks[0].id);
+  } finally { checkpoint.close(); closeAssistantStore(); }
+});
 
 async function listen(handler) {
   const server = createServer(handler).listen(0, '127.0.0.1');
@@ -25,6 +283,45 @@ async function listen(handler) {
 }
 const close = server => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
 const objectSchema = { type: 'object', properties: { value: { type: 'string' } }, required: ['value'] };
+
+test('GPT-OSS uses the same safe Ollama wire alias in tool definitions, calls and observations', async () => {
+  let sent;
+  const logical = 'agent.report_progress';
+  const { server, url } = await listen(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    sent = JSON.parse(Buffer.concat(chunks));
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ message: { thinking: 'trace', tool_calls: [{ id: 'next', function: { name: sent.tools[0].function.name, arguments: { summary: 'Found it' } } }] } }));
+  });
+  try {
+    const response = await localModelGateway('http://langvision.local/api/ai/chat', { body: JSON.stringify({ baseAddress: url, model: 'gpt-oss-120b-16k:latest',
+      tools: [{ type: 'function', function: { name: logical, parameters: objectSchema } }],
+      messages: [
+        { role: 'assistant', tool_calls: [{ id: 'prior', function: { name: logical, arguments: {} } }] },
+        { role: 'tool', tool_call_id: 'prior', tool_name: logical, content: '{"success":true}' },
+      ],
+    }) });
+    const alias = sent.tools[0].function.name;
+    assert.match(alias, /^agent_report_progress_[a-f0-9]+$/);
+    assert.equal(sent.messages[0].tool_calls[0].function.name, alias);
+    assert.equal(sent.messages[1].tool_name, alias);
+    assert.deepEqual((await response.json()).message, { thinking: 'trace', tool_calls: [{ id: 'next', function: { name: logical, arguments: { summary: 'Found it' } } }] });
+  } finally { await close(server); }
+});
+
+test('local Ollama CUDA errors remain distinguishable from LangVision timeouts', async () => {
+  const { server, url } = await listen((_req, res) => {
+    res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'runner: CUDA error; private path' }));
+  });
+  try {
+    const response = await localModelGateway('http://langvision.local/api/ai/chat', { body: JSON.stringify({ baseAddress: url, model: 'fixture', messages: [] }) });
+    assert.equal(response.status, 500);
+    const { error } = await response.json();
+    assert.match(error, /CUDA runner failure/);
+    assert.doesNotMatch(error, /private path/);
+  } finally { await close(server); }
+});
 
 test('an exact approval survives checkpoint reopening and denial cannot execute a tool', async () => {
   const root = await mkdtemp(join(tmpdir(), 'lv-approval-'));
@@ -59,6 +356,8 @@ test('an exact approval survives checkpoint reopening and denial cannot execute 
       const conversation = createConversation({ workspaceId: 'approval-workspace', surface: 'ai' });
       const pending = await reopen().submit({ conversationId: conversation.id, content: 'Save the fixture.', surface: 'ai', context: {} });
       assert.equal(pending.state, 'awaiting-clarification');
+      const executionId = pending.messages.find(message => message.role === 'user').id;
+      assert.equal(assistantDebugDatabase().prepare('SELECT started_ms FROM ai_active_budgets WHERE execution_id=?').get(executionId).started_ms, null);
       assert.equal(writes, choice === 'approve' ? 0 : 1);
       const result = await reopen().clarify(pending.clarification.id, choice);
       assert.equal(result.state, choice === 'approve' ? 'idle' : 'needs-attention');
@@ -71,6 +370,39 @@ test('an exact approval survives checkpoint reopening and denial cannot execute 
     ASSISTANT_CAPABILITIES.splice(ASSISTANT_CAPABILITIES.indexOf(capability), 1);
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('cancel aborts a waiting provider immediately and clears its live activity', async () => {
+  __setAssistantDbForTests(new Database(':memory:'));
+  const checkpoint = new Database(':memory:');
+  try {
+    const profile = saveAiProfile({ displayName: 'Slow fixture', baseUrl: 'http://fixture', model: 'slow-fixture' });
+    const definition = starterPrimitiveAgent('Slow fixture');
+    definition.profileId = profile.id;
+    saveAssistantWorkflow('slow-fixture', definition, 0);
+    selectAssistantWorkflow('slow-workspace', 'slow-fixture');
+    const conversation = createConversation({ workspaceId: 'slow-workspace', surface: 'ai' });
+    const options = { contextBroker: {}, serviceBaseUrl: 'http://fixture', fetchImpl: async (_url, { signal }) => {
+      if (!signal.aborted) await once(signal, 'abort');
+      signal.throwIfAborted();
+    } };
+    const runtime = new AssistantLangGraphRuntime({ ...options, toolHost: new ConsiliumToolHost(options), checkpointer: new SqliteSaver(checkpoint) });
+    const emitter = runtime.emitter(conversation.id);
+    const activity = new Promise(resolve => {
+      const listener = event => {
+        if (event.type !== 'model-activity' || !event.activity) return;
+        emitter.off('event', listener);
+        resolve(event.activity);
+      };
+      emitter.on('event', listener);
+    });
+    const turn = runtime.submit({ conversationId: conversation.id, content: 'Wait for the model.', surface: 'ai', context: {} });
+    assert.equal((await activity).model, 'slow-fixture');
+    assert.equal(runtime.activity(conversation.id).node, 'Investigate and respond');
+    assert.equal(runtime.cancel(conversation.id), true);
+    assert.equal((await turn).state, 'interrupted');
+    assert.equal(runtime.activity(conversation.id), null);
+  } finally { checkpoint.close(); closeAssistantStore(); }
 });
 
 test('MCP discovery and standalone package round-trip do not activate imported endpoints', async () => {

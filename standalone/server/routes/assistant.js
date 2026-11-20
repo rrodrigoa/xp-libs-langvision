@@ -22,6 +22,7 @@ import {
   getWorkspaceToolCall,
   listWorkspaceToolCalls,
   listWorkspaceAuditEvents,
+  assistantDebugDatabase,
   saveAiProfile,
   modelConnectionForProfile,
   saveWorkspaceAiContext,
@@ -29,6 +30,7 @@ import {
   selectWorkspaceAiProfile
 } from "../assistantStore.js";
 import { validateModelConnection } from '../modelConnection.js';
+import { modelTimeoutMs } from '../assistantDeadlines.js';
 
 function conversationResponse(request, conversation) {
   return request.query.compact === "1" ? compactConversation(conversation) : conversation;
@@ -51,7 +53,8 @@ function sendError(response, error) {
 
 function validateProfile(profile) {
   const connection = validateModelConnection(profile);
-  if (!Number.isInteger(profile.timeoutMs ?? 120000) || (profile.timeoutMs ?? 120000) < 1000 || (profile.timeoutMs ?? 120000) > 7200000) throw new Error('Request timeout must be between 1 second and 2 hours.');
+  const timeoutMs = modelTimeoutMs({ ...profile, ...connection });
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 7200000) throw new Error('Request timeout must be between 1 second and 2 hours.');
   if (!Number.isInteger(profile.maxConcurrency ?? 1) || (profile.maxConcurrency ?? 1) < 1 || (profile.maxConcurrency ?? 1) > 32) throw new Error('Invalid model concurrency limit.');
   if ((profile.numCtx ?? 16384) > 262144 || (profile.numCtx ?? 16384) < 2048) throw new Error('Context budget must be between 2,048 and 262,144 tokens.');
   if (connection.baseUrlSource === 'environment') {
@@ -173,7 +176,8 @@ export function createAssistantRouter({ agent, fetchImpl = fetch, serviceBaseUrl
   });
 
   router.delete("/profiles/:profileId", (request, response) => {
-    response.status(deleteAiProfile(request.params.profileId) ? 204 : 404).end();
+    try { response.status(deleteAiProfile(request.params.profileId) ? 204 : 404).end(); }
+    catch (error) { sendError(response, error); }
   });
 
   router.post("/profiles/:profileId/test", async (request, response) => {
@@ -203,7 +207,7 @@ export function createAssistantRouter({ agent, fetchImpl = fetch, serviceBaseUrl
       const loadedContext = loaded?.contextLength ?? loaded?.context_length ?? null;
       const gpuResidency = loadedSize > 0 ? loadedVram / loadedSize : 0;
       const digestMatches = !profile.expectedDigest || profile.expectedDigest === (installed?.digest ?? loaded?.digest);
-      const contextMatches = !loadedContext || loadedContext === profile.numCtx;
+      const contextMatches = true; // Ollama owns the context size for this model.
       const modelCapabilities = installed?.capabilities ?? loaded?.capabilities ?? [];
       const toolCapable = modelCapabilities.includes("tools");
       const capability = {
@@ -343,6 +347,8 @@ export function createAssistantRouter({ agent, fetchImpl = fetch, serviceBaseUrl
     const emitter = agent.emitter(request.params.conversationId);
     const listener = event => response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     emitter.on("event", listener);
+    listener({ type: 'model-activity', activity: agent.activity?.(request.params.conversationId) ?? null });
+    listener({ type: 'node-activity', activity: agent.activeNode?.(request.params.conversationId) ?? null });
     const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 15000);
     request.on("close", () => {
       clearInterval(heartbeat);
@@ -351,6 +357,12 @@ export function createAssistantRouter({ agent, fetchImpl = fetch, serviceBaseUrl
   });
 
   router.get('/executions',(request,response)=>{try{response.json(listAssistantExecutions(String(request.query.workspaceId??'default'),request.query));}catch(error){sendError(response,error);}});
+  router.get('/historia-link/:id', (request, response) => {
+    const db = assistantDebugDatabase();
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE name='ai_debug_tool_owners'").get() &&
+      db.prepare('SELECT execution_id AS executionId, node_execution_id AS attemptId FROM ai_debug_tool_owners WHERE workspace_id=? AND tool_call_id=?').get(String(request.query.workspaceId ?? 'default'), request.params.id);
+    return row ? response.json(row) : response.status(404).json({ error: 'Tool execution not found.' });
+  });
   router.get('/executions/:id/invocations',(request,response)=>{try{response.json(assistantExecutionInvocations(String(request.query.workspaceId??'default'),request.params.id,request.query));}catch(error){sendError(response,error);}});
   router.get('/executions/:id/attempts/:nodeId',(request,response)=>{try{const value=assistantAttemptInspection(String(request.query.workspaceId??'default'),request.params.id,request.params.nodeId);response.status(value?200:404).json(value??{error:'Attempt not found.'});}catch(error){sendError(response,error);}});
   router.get('/executions/:id/events',(request,response)=>{try{response.json(assistantExecutionEvents(String(request.query.workspaceId??'default'),request.params.id,request.query));}catch(error){sendError(response,error);}});

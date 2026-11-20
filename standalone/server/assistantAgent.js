@@ -32,6 +32,7 @@ export class ConsiliumToolHost {
     captureToolArtifact(toolCall,'tool-input',{toolCallId:toolCall.id,name:capability.name,args,expectedRevision:toolCall.expectedRevision,approvedAt:toolCall.approvedAt,status:toolCall.status});
     try {
       const result = await capability.execute(args, execution, toolCall);
+      if (capability.name.startsWith('terminal.') && result?.ok === false) throw Object.assign(new Error(result.error.message), { code: result.error.code });
       captureToolArtifact(toolCall,'tool-result',{toolCallId:toolCall.id,name:capability.name,result});
       updateToolCall(toolCall.id, "completed", { result });
       addMessage(
@@ -44,7 +45,7 @@ export class ConsiliumToolHost {
       if (result?.clientAction) this.emit(toolCall.conversationId, "client-action", { action: result.clientAction });
       return { ok: true, result };
     } catch (error) {
-      captureToolArtifact(toolCall,'tool-error',{toolCallId:toolCall.id,name:capability.name,message:error.message,stack:error.stack});
+      captureToolArtifact(toolCall,'tool-error',{toolCallId:toolCall.id,name:capability.name,code:error.code,message:error.message,stack:error.stack});
       updateToolCall(toolCall.id, "failed", { error: error.message });
       addMessage(
         toolCall.conversationId,

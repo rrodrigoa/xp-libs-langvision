@@ -85,6 +85,6 @@ export function presentAgentEdges(definition, { selectedId, traversed = new Set(
       markerEnd: { type: 'arrowclosed', color },
       style: { stroke: color, strokeWidth: edge.id === selectedId ? 3.5 : visited ? 3 : 1.8, ...(role === 'loop' ? { strokeDasharray: '7 5' } : {}) },
       labelStyle: { fill: color, fontSize: 11, fontWeight: role === 'loop' ? 600 : 400 },
-      labelBgStyle: { fill: 'var(--site-color-canvas)', fillOpacity: .96 }, labelBgPadding: [6, 3], labelBgBorderRadius: 4 };
+      labelBgStyle: { fill: 'var(--site-color-panel)', fillOpacity: 1 }, labelBgPadding: [6, 3], labelBgBorderRadius: 4 };
   });
 }

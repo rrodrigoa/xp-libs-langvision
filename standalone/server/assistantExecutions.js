@@ -109,7 +109,7 @@ export function assistantExecutionEvents(workspaceId,executionId,{after=0,limit=
   const take=Math.max(1,Math.min(100,Math.floor(Number(limit)||60)));
   const rows=database().prepare(`SELECT rowid AS sequence,* FROM ai_canonical_execution_events WHERE workspace_id=? AND
     (json_extract(metadata_json,'$.userMessageId')=? OR json_extract(metadata_json,'$.executionId')=?)
-    AND kind IN ('agent-stage','query-translation-step','agent-workflow','query-translation')
+    AND kind IN ('agent-stage','query-translation-step','agent-workflow','query-translation','agent-terminal-session')
     AND (? IS NULL OR json_extract(metadata_json,'$.invocationId')=?) AND rowid>? ORDER BY rowid LIMIT ?`)
     .all(workspaceId,executionId,executionId,invocationId??null,invocationId??null,Math.max(0,Number(after)||0),take+1);
   return {events:rows.slice(0,take).map(row=>({id:row.action_id,sequence:row.sequence,kind:row.kind,title:row.title,status:row.status,createdAt:row.created_at,metadata:JSON.parse(row.metadata_json??'{}')})),hasMore:rows.length>take,nextCursor:rows.length>take?rows[take-1].sequence:null};

@@ -48,11 +48,11 @@ try {
   await page.getByTestId('ai-agent-inspection').waitFor();
   const before = await (await page.request.get('/api/assistant/workflows?workspaceId=default')).json();
   await page.getByRole('button', { name: 'Packages', exact: true }).click();
-  const link = page.getByRole('link', { name: 'Download agent package' });
+  const link = page.getByRole('link', { name: 'Download agent ZIP' });
   await link.waitFor();
   const file = await page.request.get(await link.getAttribute('href'));
   assert.ok(file.ok(), await file.text());
-  await page.getByLabel('Import package').setInputFiles({ name: 'smoke.langvision.json', mimeType: 'application/json', buffer: await file.body() });
+  await page.getByLabel('Import package').setInputFiles({ name: 'smoke.langvision.zip', mimeType: 'application/zip', buffer: await file.body() });
   await page.getByRole('status').filter({ hasText: 'Draft imported' }).waitFor();
   const after = await (await page.request.get('/api/assistant/workflows?workspaceId=default')).json();
   assert.equal(after.activeId, before.activeId);

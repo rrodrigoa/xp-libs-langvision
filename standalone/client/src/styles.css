@@ -1813,7 +1813,10 @@ button.query-plan-node {
 
 .ai-graph-legend [data-role="loop"] { --ai-role-color: var(--ai-graph-loop); }
 
-.ai-graph-node { border-top: 3px solid var(--ai-role-color); }
+.ai-graph-node { box-sizing: border-box; color: var(--site-color-text); background: var(--site-color-panel); border: 1px solid var(--site-color-border); border-top: 3px solid var(--ai-role-color, var(--site-color-accent)); border-radius: 8px; box-shadow: 0 3px 12px #0004; }
+.ai-graph-node header { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--site-color-border); }
+.ai-graph-node footer { padding: 8px 12px; border-top: 1px solid var(--site-color-border); }
+.ai-graph-node.is-selected { outline: 2px solid var(--ai-role-color, var(--site-color-accent)); outline-offset: 2px; }
 
 .ai-graph-node.is-selected { border-top-color: var(--ai-role-color); }
 

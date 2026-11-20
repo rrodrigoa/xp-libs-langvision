@@ -28,7 +28,8 @@ export function compilePrimitiveAgent(definition, adapters, { checkpointer, work
         if (steps > workflow.maxSteps) throw new Error(`Workflow '${workflow.name}' exceeded its saved ${workflow.maxSteps}-step budget at '${node.label}'.`);
         let input, result, route, native = state.native;
         try {
-          input = resolvePrimitiveBinding(node.settings.input, state);
+          const session = node.handler === 'llm' && node.operationVersion === 2 ? state.native?.sessions?.[node.id] : null;
+          input = session ? session.input : resolvePrimitiveBinding(node.settings.input, state);
           const s = node.settings;
           const nativeOutput = node.operationVersion === 2 ? await executeNativePrimitive({ node, workflow, definition, state, config, input, adapters }) : null;
           if (nativeOutput) ({ result, route, native } = nativeOutput);
@@ -110,7 +111,7 @@ export function compilePrimitiveAgent(definition, adapters, { checkpointer, work
           // LangGraph interrupts are control flow, not an agent error edge.
           if (error.name === 'GraphInterrupt' || error.name === 'NodeInterrupt') throw error;
           config.signal?.throwIfAborted();
-          if (error.primitiveBudgetExhausted) throw error;
+          if (error.primitiveBudgetExhausted || error.primitiveProviderFailure) throw error;
           const edge = workflow.edges.find(edge => edge.source === node.id && edge.kind === 'error');
           if (!edge) throw error;
           const failure = { nodeId: node.id, operation: node.handler, message: error.message, input: input ?? null, output: error.modelResponse ?? result ?? null };

@@ -10,6 +10,14 @@ export function AgentDesigner({ workspaceId, onClose, inspection, onInspectionCl
   const [catalog, setCatalog] = useState(null), [draft, setDraft] = useState(null);
   const [error, setError] = useState(''), [clone, setClone] = useState(null);
   const profiles = useAssistantStore(state => state.profiles);
+  const conversationId = useAssistantStore(state => state.conversation?.id);
+  const [live, setLive] = useState(null);
+  useEffect(() => {
+    if (!conversationId) return;
+    const events = new EventSource(`/api/assistant/conversations/${encodeURIComponent(conversationId)}/events`);
+    events.addEventListener('node-activity', event => setLive(JSON.parse(event.data).activity));
+    return () => { events.close(); setLive(null); };
+  }, [conversationId]);
   const initialize = useAssistantStore(state => state.initialize);
   useEffect(() => { void initialize(workspaceId, 'creatio'); }, [workspaceId, initialize]);
   useEffect(() => {
@@ -17,6 +25,7 @@ export function AgentDesigner({ workspaceId, onClose, inspection, onInspectionCl
     agentDesignRequest(`/workflows?workspaceId=${encodeURIComponent(workspaceId)}`, { signal: controller.signal }).then(value => {
       let remembered;
       try { remembered = localStorage.getItem(`consilium-designer-${workspaceId}`); } catch { /* Optional preference. */ }
+      if (remembered === 'consilium-primitive' && value.activeId === 'langvision-coding-agent') remembered = null;
       setCatalog(value);
       setDraft(value.workflows.find(item => item.id === remembered) ?? value.workflows.find(item => item.id === value.activeId));
     }).catch(error => { if (!controller.signal.aborted) setError(error.message); });
@@ -44,5 +53,5 @@ export function AgentDesigner({ workspaceId, onClose, inspection, onInspectionCl
   </section>;
   if (error) return <p role="alert">{error}</p>;
   if (!draft || !catalog) return <ActivityIndicator label="Loading agent" />;
-  return <PrimitiveAgentDesigner key={draft.id} workspaceId={workspaceId} draft={draft} catalog={catalog} profiles={profiles} onDraft={setDraft} onCatalog={setCatalog} onSelect={select} onClose={onClose} />;
+  return <PrimitiveAgentDesigner key={draft.id} workspaceId={workspaceId} draft={draft} catalog={catalog} profiles={profiles} live={live?.graphVersion?.startsWith(draft.id + '@') ? live : null} onDraft={setDraft} onCatalog={setCatalog} onSelect={select} onClose={onClose} />;
 }

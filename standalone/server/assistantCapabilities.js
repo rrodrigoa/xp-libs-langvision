@@ -74,10 +74,10 @@ export async function refreshMcpConnection(id) {
       return saved;
     };
     ASSISTANT_CAPABILITIES.push({
-      name: id + '.' + tool.name, connectionId: id,
+      name: id + '.' + tool.name, connectionId: id, version: 1,
       description: String(tool.description ?? tool.name).slice(0, 4000), schema: tool.inputSchema,
-      risk: 'write', preview: () => ({ summary: 'Call ' + tool.name + ' on ' + id + '.' }),
-      revision: () => current().revision,
+      risk: 'write', preview: args => ({ summary: 'Send arguments to ' + tool.name + ' on ' + id + '.', arguments: args }),
+      revision: () => String(current().revision),
       execute: async (args, execution) => {
         const result = await withClient(current(), client => client.callTool({ name: tool.name, arguments: args }, undefined, {
           timeout: 30000, signal: execution.signal,

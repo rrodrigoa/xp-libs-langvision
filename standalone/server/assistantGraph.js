@@ -5,9 +5,11 @@ import { beginAssistantExecution } from './assistantExecutions.js';
 import { cancelExecutionSpans } from './assistantSpans.js';
 import { compilePrimitiveAgent } from './primitiveAgentRuntime.js';
 import { createPrimitiveAdapters, savePrimitiveRun, primitiveRun } from './primitiveAgentAdapters.js';
-import { activeAssistantWorkflow, addMessage, assistantCheckpointDbPath, createAssistantTurn, getAssistantClarification, getAssistantTurn, getConversation, getWorkspaceAiProfile, getAiProfile, recordWorkspaceAuditEvent, setAssistantTurnStatus, setConversationState } from './assistantStore.js';
+import { activeAssistantWorkflow, addMessage, assistantCheckpointDbPath, assistantDebugDatabase, createAssistantTurn, getAssistantClarification, getAssistantTurn, getConversation, getWorkspaceAiProfile, getAiProfile, recordWorkspaceAuditEvent, setAssistantTurnStatus, setConversationState } from './assistantStore.js';
 import { assistantModelPolicy } from './assistantModelPolicy.js';
 import { ensureGraphKnowledge } from './assistantGraphConfiguration.js';
+import { activeBudget, configuredMinutes } from './assistantDeadlines.js';
+import { primitiveWorkflows } from '../shared/primitiveAgentModel.js';
 export const DEFAULT_ASSISTANT_RUNTIME = 'langgraph';
 function terminalStateForConversation(conversation) {
   if (!conversation) return "failed";
@@ -22,33 +24,58 @@ function terminalStateForConversation(conversation) {
 }
 
 export class AssistantLangGraphRuntime {
-  constructor({ toolHost, contextBroker, fetchImpl = fetch, serviceBaseUrl, checkpointer = null }) {
+  constructor({ toolHost, contextBroker, fetchImpl = fetch, serviceBaseUrl, checkpointer = null, terminal, research }) {
     this.toolHost = toolHost;
+    this.terminal = terminal;
+    this.research = research;
     this.contextBroker = contextBroker;
     this.fetchImpl = fetchImpl;
     this.serviceBaseUrl = serviceBaseUrl;
     this.mode = 'langgraph';
     this.turnControllers = new Map();
     this.executionControllers = new Map();
+    this.modelActivity = new Map();
+    this.nodeActivity = new Map();
     this.checkpointer = checkpointer ?? SqliteSaver.fromConnString(assistantCheckpointDbPath());
   }
   emitter(id) { return this.toolHost.emitter(id); }
   emit(id, type, payload = {}) { return this.toolHost.emit(id, type, payload); }
+  activity(id) { return this.modelActivity.get(id) ?? null; }
+  activeNode(id) { return this.nodeActivity.get(id) ?? null; }
+  budget(executionId, definition, profile, controller) {
+    const coding = primitiveWorkflows(definition).some(([, workflow]) => workflow.nodes.some(node => node.settings?.toolNames?.includes('workspace.run')));
+    const limit = coding ? configuredMinutes(process.env.LANGVISION_CODING_ACTIVE_MINUTES, 60)
+      : assistantModelPolicy(profile).output.turnTimeoutMs;
+    return activeBudget(assistantDebugDatabase(), executionId, limit, controller);
+  }
   cancel(conversationId) {
     const controller = this.turnControllers.get(conversationId);
     controller?.abort(new Error('Agent execution canceled.'));
+    if (this.modelActivity.delete(conversationId)) this.emit(conversationId, 'model-activity', { activity: null });
     const executionId = getConversation(conversationId)?.messages.findLast(message => message.role === 'user')?.id;
     if (executionId) cancelExecutionSpans(executionId);
+    if (executionId) void this.terminal?.closeExecution(executionId, 'execution-canceled');
+    if (executionId) void this.research?.cleanupTurn?.(executionId);
     return this.toolHost.cancel(conversationId) || Boolean(controller);
   }
   buildGraph(definition) {
     if (definition?.schemaVersion !== 5) throw new Error('Only Consilium Primitive definitions are executable. Historical staged definitions remain read-only.');
     return compilePrimitiveAgent(definition, createPrimitiveAdapters({ definition, fetchImpl: this.fetchImpl,
-      serviceBaseUrl: this.serviceBaseUrl, toolHost: this.toolHost, emit: (id, type, value) => this.emit(id, type, value) }), { checkpointer: this.checkpointer });
+      serviceBaseUrl: this.serviceBaseUrl, toolHost: this.toolHost, emit: (id, type, value) => this.emit(id, type, value),
+      onNodeActivity: (id, activity) => {
+        if (activity) this.nodeActivity.set(id, activity);
+        else this.nodeActivity.delete(id);
+        this.emit(id, 'node-activity', { activity });
+      },
+      onModelActivity: (id, activity) => {
+        if (activity) this.modelActivity.set(id, activity);
+        else this.modelActivity.delete(id);
+        this.emit(id, 'model-activity', { activity });
+      } }), { checkpointer: this.checkpointer });
   }
   graphConfig(threadId) { return { configurable: { thread_id: threadId } }; }
   async submit({ conversationId, content, surface, context }) {
-    if (this.turnControllers.get(conversationId) && !this.turnControllers.get(conversationId).signal.aborted) throw Object.assign(new Error('This conversation already has an active execution. Cancel it before submitting another request.'), { status: 409 });
+    if (this.turnControllers.has(conversationId)) throw Object.assign(new Error('This conversation already has an active execution. Wait for cancellation to finish before submitting another request.'), { status: 409 });
     const conversation = getConversation(conversationId);
     if (!conversation) throw new Error(`Conversation '${conversationId}' was not found.`);
     const controller = new AbortController();
@@ -57,7 +84,6 @@ export class AssistantLangGraphRuntime {
     try {
     const workflow = typeof this.contextBroker?.getCatalog === 'function' ? await ensureGraphKnowledge(this.contextBroker, conversation.workspaceId) : activeAssistantWorkflow(conversation.workspaceId);
     const profile = workflow.definition.profileId ? getAiProfile(workflow.definition.profileId) : getWorkspaceAiProfile(conversation.workspaceId);
-    deadline = setTimeout(() => { controller.abort(new Error('The saved graph execution deadline was exceeded.')); this.toolHost.cancel(conversationId); }, assistantModelPolicy(profile).output.turnTimeoutMs);
     controller.signal.throwIfAborted();
     const userMessage = addMessage(conversationId, "user", content, surface, { graphRuntime: this.mode, workflowId: workflow.id, workflowVersion: workflow.version });
     const turn = createAssistantTurn({conversationId,userMessageId:userMessage.id,originalRequest:content,tasks:[]});
@@ -69,6 +95,7 @@ export class AssistantLangGraphRuntime {
     this.executionControllers.set(userMessage.id, controller);
     try {
     savePrimitiveRun(userMessage.id, conversationId, workflow.definition);
+    deadline = this.budget(userMessage.id, workflow.definition, profile, controller);
     const output = await this.buildGraph(workflow.definition).invoke({
       entry: { request: content, workspaceId: conversation.workspaceId, workspace: Object.fromEntries(Object.entries(context ?? {}).filter(([key]) => !key.startsWith('agent'))) },
       variables: {}, steps: 0,
@@ -88,9 +115,10 @@ export class AssistantLangGraphRuntime {
     } catch (error) {
       if (controller.signal.aborted) {
         const ownsExecution = this.turnControllers.get(conversationId) === controller;
+        cancelExecutionSpans(userMessage.id);
         if (ownsExecution) setConversationState(conversationId, 'interrupted', surface);
         if(turn)setAssistantTurnStatus(turn.id,'interrupted');
-        addMessage(conversationId, 'assistant', 'Agent execution canceled. Completed actions will not be replayed.', surface, { canceled: true, userMessageId: userMessage.id, workflowId: workflow.id, workflowVersion: workflow.version });
+        addMessage(conversationId, 'assistant', `${controller.signal.reason?.message ?? 'Agent execution canceled.'} Completed actions will not be replayed.`, surface, { canceled: true, userMessageId: userMessage.id, workflowId: workflow.id, workflowVersion: workflow.version });
         if (ownsExecution) this.emit(conversationId, 'generation-interrupted');
         return getConversation(conversationId);
       }
@@ -102,7 +130,13 @@ export class AssistantLangGraphRuntime {
       recordWorkspaceAuditEvent({ workspaceId: conversation.workspaceId, kind: 'agent-workflow', title: 'Agent workflow failed', summary: message, status: 'failed', surface, signature: userMessage.id, metadata: { conversationId, userMessageId: userMessage.id, workflowId: workflow.id, version: workflow.version, errorType: error.name } });
       this.emit(conversationId, 'generation-failed', { error: message });
       return getConversation(conversationId);
-    } finally { this.executionControllers.delete(userMessage.id); }
+    } finally {
+      this.executionControllers.delete(userMessage.id);
+      if (getConversation(conversationId)?.clarification?.status !== 'pending') {
+        await this.terminal?.closeExecution(userMessage.id);
+        await this.research?.cleanupTurn?.(userMessage.id);
+      }
+    }
     } catch (error) {
       const canceled = controller.signal.aborted;
       const userMessage = addMessage(conversationId, 'user', content, surface);
@@ -113,22 +147,36 @@ export class AssistantLangGraphRuntime {
       recordWorkspaceAuditEvent({ workspaceId: conversation.workspaceId, kind: 'agent-workflow', title: canceled ? 'Agent execution canceled' : 'Agent initialization failed', summary: message, status: canceled ? 'canceled' : 'failed', surface, signature: userMessage.id, metadata: { conversationId, userMessageId: userMessage.id, errorType: canceled ? null : error.name } });
       if (ownsExecution) this.emit(conversationId, canceled ? 'generation-interrupted' : 'generation-failed', { error: canceled ? null : message });
       return getConversation(conversationId);
-    } finally { clearTimeout(deadline); if (this.turnControllers.get(conversationId) === controller) this.turnControllers.delete(conversationId); }
+    } finally {
+      try { deadline?.(); }
+      finally { if (this.turnControllers.get(conversationId) === controller) this.turnControllers.delete(conversationId); }
+    }
   }
 
   async resumeExecution(conversationId, userMessageId, work) {
-    if (this.turnControllers.get(conversationId) && !this.turnControllers.get(conversationId).signal.aborted) throw Object.assign(new Error('This conversation already has an active execution.'), { status: 409 });
+    if (this.turnControllers.has(conversationId)) throw Object.assign(new Error('This conversation already has an active execution.'), { status: 409 });
     const controller = new AbortController();
     this.turnControllers.set(conversationId, controller); this.executionControllers.set(userMessageId, controller);
     try { return await work(controller); }
     catch (error) {
       if (!controller.signal.aborted) throw error;
       const ownsExecution = this.turnControllers.get(conversationId) === controller;
+      cancelExecutionSpans(userMessageId);
       if (ownsExecution) setConversationState(conversationId, 'interrupted');
-      addMessage(conversationId, 'assistant', 'Agent execution canceled. Completed actions will not be replayed.', getConversation(conversationId).currentSurface, { canceled: true, userMessageId });
+      const conversation = getConversation(conversationId);
+      const turn = conversation.turns?.find(item => item.userMessageId === userMessageId);
+      if (turn) setAssistantTurnStatus(turn.id, 'interrupted');
+      addMessage(conversationId, 'assistant', `${controller.signal.reason?.message ?? 'Agent execution canceled.'} Completed actions will not be replayed.`, conversation.currentSurface, { canceled: true, userMessageId, turnId: turn?.id });
       if (ownsExecution) this.emit(conversationId, 'generation-interrupted');
       return getConversation(conversationId);
-    } finally { if (this.turnControllers.get(conversationId) === controller) this.turnControllers.delete(conversationId); this.executionControllers.delete(userMessageId); }
+    } finally {
+      if (this.turnControllers.get(conversationId) === controller) this.turnControllers.delete(conversationId);
+      this.executionControllers.delete(userMessageId);
+      if (getConversation(conversationId)?.clarification?.status !== 'pending') {
+        await this.terminal?.closeExecution(userMessageId);
+        await this.research?.cleanupTurn?.(userMessageId);
+      }
+    }
   }
 
   async clarify(clarificationId, response) {
@@ -138,7 +186,9 @@ export class AssistantLangGraphRuntime {
     return this.resumeExecution(clarification.conversationId, turn.userMessageId, async controller => {
     const primitive = primitiveRun(turn.userMessageId);
     if (primitive) {
+      const finishBudget = this.budget(turn.userMessageId, primitive.definition, getWorkspaceAiProfile(getConversation(clarification.conversationId).workspaceId), controller);
       try {
+      controller.signal.throwIfAborted();
       await this.buildGraph(primitive.definition).invoke(new Command({ resume: String(response ?? '').trim() }), {
         ...this.graphConfig(turn.userMessageId), recursionLimit: primitive.definition.maxSteps + 5, signal: controller.signal
       });
@@ -148,7 +198,7 @@ export class AssistantLangGraphRuntime {
         const content = `The resumed agent workflow failed. ${String(error.message).slice(0, 2000).replace(/(SharedAccessKey|Password|ApiKey|Bearer)(\s*[=: ]\s*)[^;\s"']+/gi, '$1$2[redacted]')}\nInspect the failed node in Historia. Completed actions will not be replayed.`;
         addMessage(clarification.conversationId, 'assistant', content, getConversation(clarification.conversationId).currentSurface, { error: true, turnId: turn.id, userMessageId: turn.userMessageId });
         this.emit(clarification.conversationId, 'generation-failed', { error: content });
-      }
+      } finally { finishBudget(); }
       return getConversation(clarification.conversationId);
     }
     throw new Error('This historical staged execution is retired and cannot resume. Start a new turn using Consilium Primitive.');

@@ -31,7 +31,7 @@ export function clearWorkspaceAiHistory(workspaceId,isRunning=()=>false) {
     if([...activeAssistantTranslations.values()].includes(workspaceId))throw busyHistory();
     const count=db.prepare('SELECT COUNT(*) AS count FROM ai_executions WHERE workspace_id=?').get(workspaceId).count;
     db.prepare('INSERT OR IGNORE INTO ai_history_cleared SELECT workspace_id,execution_id FROM ai_executions WHERE workspace_id=?').run(workspaceId);
-    for (const table of ['ai_primitive_calls', 'ai_primitive_humans', 'ai_primitive_human_instances', 'ai_primitive_runs']) if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) {
+    for (const table of ['ai_primitive_calls', 'ai_primitive_humans', 'ai_primitive_human_instances', 'ai_primitive_runs', 'ai_active_budgets']) if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) {
       db.prepare(`DELETE FROM ${table} WHERE execution_id IN (SELECT execution_id FROM ai_executions WHERE workspace_id=?)`).run(workspaceId);
     }
     db.prepare('DELETE FROM ai_executions WHERE workspace_id=?').run(workspaceId);

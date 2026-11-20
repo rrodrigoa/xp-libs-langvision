@@ -17,7 +17,7 @@ function assertPortable(value, depth = 0) {
   }
 }
 function remapToolNames(value, map, field = '') {
-  if (typeof value === 'string' && ['toolNames', 'toolName', 'afterTool', 'whenObserved'].includes(field)) {
+  if (typeof value === 'string' && ['toolNames', 'toolName', 'afterTool', 'whenObserved', 'referenceTool', 'planExemptTools'].includes(field)) {
     for (const [from, to] of map) if (value.startsWith(from + '.')) return to + value.slice(from.length);
   }
   if (Array.isArray(value)) return value.map(item => remapToolNames(item, map, field));

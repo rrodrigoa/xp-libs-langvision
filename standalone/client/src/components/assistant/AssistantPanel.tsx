@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Bot, Check, Circle, CircleAlert, Cpu, Link2, Send, Settings2, Square, X, Trash2 } from "lucide-react";
+import { Bot, Check, Circle, CircleAlert, Cpu, Link2, Maximize2, Minimize2, Send, Settings2, Square, X, Trash2 } from "lucide-react";
 import { canClearAssistantConversation,canCancelAssistantConversation } from '../../../../shared/assistantHistoryPolicy.js';
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ActivityIndicator } from "../ActivityIndicator";
-import { OLLAMA_MODEL_PRESETS, cachedModelProfile, cachedSelectionStatus } from '../../../../shared/assistantModelPresets.js';
+import { cachedSelectionStatus } from '../../../../shared/assistantModelPresets.js';
 import { useAssistantStore } from "../../stores/assistantStore";
 import { assistantApi, type AssistantSurface } from "./assistantApi";
 import { ConnectionValueField } from '../ConnectionValueField.jsx';
@@ -20,6 +20,8 @@ type Props = {
   surfaceLabel?: string;
   onClose?: () => void;
   onEditAgent?: () => void;
+  onToggleExpanded?: () => void;
+  expanded?: boolean;
 };
 
 function AssistantMarkdown({ children }: { children: string }) {
@@ -28,8 +30,9 @@ function AssistantMarkdown({ children }: { children: string }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          img: ({ alt }) => <span>{alt || 'Image omitted'}</span>,
           a: ({ children: linkChildren, ...props }) => (
-            <a {...props} target="_blank" rel="noreferrer">{linkChildren}</a>
+            <a {...props} target="_blank" rel="noreferrer noopener">{linkChildren}</a>
           )
         }}
       >
@@ -44,6 +47,7 @@ export function ProfileSettings({ workspaceId, initiallyOpen = false }: { worksp
   const activeProfile = useAssistantStore(state => state.activeProfile);
   const saveProfile = useAssistantStore(state => state.saveProfile);
   const testProfile = useAssistantStore(state => state.testProfile);
+  const deleteProfile = useAssistantStore(state => state.deleteProfile);
   const selectProfile = useAssistantStore(state => state.selectProfile);
   const workspaceContext = useAssistantStore(state => state.workspaceContext);
   const saveWorkspaceContext = useAssistantStore(state => state.saveWorkspaceContext);
@@ -56,36 +60,41 @@ export function ProfileSettings({ workspaceId, initiallyOpen = false }: { worksp
     provider: 'ollama', baseUrlSource: 'value', baseUrlEnvironmentVariable: '',
     authMode: 'none', apiKey: '', apiKeySource: 'value', apiKeyEnvironmentVariable: '',
     tokenLimitParameter: 'max_tokens', sendSampling: true, reasoningEffort: '',
-    timeoutMs: 600000, maxConcurrency: 1,
-    displayName: "Local qwen3.6",
+    timeoutMs: null as number | null, maxConcurrency: 1,
+    displayName: "",
     baseUrl: "http://127.0.0.1:11434",
-    model: "qwen3.6:latest",
+    model: "",
     numCtx: 16384,
     temperature: 0,
     seed: 42,
     think: false,
     thinkingMode: "off",
     keepAlive: "30m",
-    expectedDigest: "07d35212591fc27746f0a317c975a6d68754fb38e9053d82e25f06057af28522"
+    expectedDigest: ""
   });
   const [contextDraft, setContextDraft] = useState({ title: "Workspace domain context", content: "" });
   const [skillDraft, setSkillDraft] = useState({ title: "", kind: "domain", content: "" });
   const [settingsBusy, setSettingsBusy] = useState(false);
+  const [open, setOpen] = useState(initiallyOpen);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [cancelVersion,setCancelVersion]=useState(0);
   const [modelInfo,setModelInfo]=useState<{capabilities:string[];thinking:{values:(string|boolean)[];default?:string|boolean}|null}|null>(null);
   const [settingsError, setSettingsError] = useState("");
-  useEffect(() => {
+  function editProfile(activeProfile: any) {
     if (!activeProfile) return;
+    setConfirmDelete(false);
     setDraft({ id: activeProfile.id, displayName: activeProfile.displayName,
       provider: activeProfile.provider ?? 'ollama', baseUrlSource: activeProfile.baseUrlSource ?? 'value', baseUrlEnvironmentVariable: activeProfile.baseUrlEnvironmentVariable ?? '',
       authMode: activeProfile.authMode ?? 'none', apiKey: '', apiKeySource: activeProfile.apiKeySource ?? 'value', apiKeyEnvironmentVariable: activeProfile.apiKeyEnvironmentVariable ?? '',
       tokenLimitParameter: activeProfile.tokenLimitParameter ?? 'max_tokens', sendSampling: activeProfile.sendSampling ?? true, reasoningEffort: activeProfile.reasoningEffort ?? '',
-      timeoutMs: activeProfile.timeoutMs ?? 600000, maxConcurrency: activeProfile.maxConcurrency ?? 1,
+      timeoutMs: activeProfile.timeoutMs, maxConcurrency: activeProfile.maxConcurrency ?? 1,
       baseUrl: activeProfile.baseUrl, model: activeProfile.model, numCtx: activeProfile.numCtx ?? 16384,
       temperature: activeProfile.temperature ?? 0, seed: activeProfile.seed ?? 42,
       think: activeProfile.think ?? false, thinkingMode: activeProfile.thinkingMode ?? (activeProfile.think ? 'on' : 'off'),
       keepAlive: activeProfile.keepAlive ?? '30m', expectedDigest: activeProfile.expectedDigest ?? '' });
-  }, [activeProfile?.id,cancelVersion]);
+  }
+  useEffect(() => { if (!draft.id) editProfile(activeProfile); }, [activeProfile?.id]);
+  useEffect(() => { editProfile(profiles.find(profile => profile.id === draft.id) ?? activeProfile); }, [cancelVersion]);
   const [models, setModels] = useState<{ name: string; digest?: string;size?:number }[]>([]);
   const [modelsLoaded,setModelsLoaded]=useState(false);
   const [modelSearch,setModelSearch]=useState('');
@@ -95,6 +104,17 @@ export function ProfileSettings({ workspaceId, initiallyOpen = false }: { worksp
   const discoveryGeneration = useRef(0);
   useEffect(() => { discoveryGeneration.current++; setModels([]);setModelsLoaded(false); }, [draft.baseUrl,draft.provider,draft.authMode,draft.apiKey,draft.apiKeySource,draft.apiKeyEnvironmentVariable,draft.baseUrlSource,draft.baseUrlEnvironmentVariable]);
   useEffect(() => () => { discoveryGeneration.current++; }, []);
+  useEffect(() => {
+    if (!open || draft.provider !== 'ollama' || !draft.baseUrl) return;
+    const generation = ++discoveryGeneration.current;
+    const timer = setTimeout(() => {
+      assistantApi.discoverModels(draft.baseUrl, draft).then(result => {
+        if (generation === discoveryGeneration.current) { setModels(result.models); setModelsLoaded(true); }
+      }).catch(error => { if (generation === discoveryGeneration.current) setSettingsError(error instanceof Error ? error.message : 'Model discovery failed.'); });
+    }, 250);
+    return () => { clearTimeout(timer); discoveryGeneration.current++; };
+  }, [open, draft.id, draft.baseUrl, draft.provider, cancelVersion]);
+  const selectedProfile = profiles.find(profile => profile.id === draft.id);
   function selectModel(model: string) {
     const installed = models.find(item => item.name === model);
     setDraft(current => ({ ...current, model, expectedDigest: installed?.digest ?? "" }));
@@ -114,19 +134,19 @@ export function ProfileSettings({ workspaceId, initiallyOpen = false }: { worksp
   const gpu = assistantGpuStatus(activeProfile);
   const cacheStatus=cachedSelectionStatus(draft.model,draft.expectedDigest,models,modelsLoaded);
   return (
-    <details className="assistant-profile-settings" data-testid="assistant-profile-settings" open={initiallyOpen || undefined}>
+    <details className="assistant-profile-settings" data-testid="assistant-profile-settings" open={open} onToggle={event => setOpen(event.currentTarget.open)}>
       <summary><Settings2 size={14} /> Agent model connection</summary>
       {profiles.length ? (
-        <label>Active profile
-          <select value={activeProfile?.id ?? ""} disabled={settingsBusy} onChange={event => void settingsAction(() => selectProfile(event.target.value))}>
-            <option value="">Select profile</option>
+        <label>Saved connection
+          <select value={draft.id ?? ""} disabled={settingsBusy} onChange={event => { setSettingsError(''); editProfile(profiles.find(profile => profile.id === event.target.value)); }}>
+            <option value="" disabled>New connection</option>
             {profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.displayName} / {profile.model}</option>)}
           </select>
         </label>
       ) : null}
       <fieldset className="creatio-settings-category"><legend>Connection</legend><div className="assistant-profile-grid">
-        <label>Name<input data-testid="assistant-profile-name" value={draft.displayName} onChange={event => setDraft({ ...draft, displayName: event.target.value })} /></label>
-        <label>Provider<select data-testid="assistant-profile-provider" value={draft.provider} onChange={event=>setDraft(current=>({...current,provider:event.target.value,baseUrlSource:'value',baseUrl:event.target.value==='openai-compatible'?'http://host.docker.internal:11434/v1/':'http://host.docker.internal:11434',expectedDigest:'',authMode:'none',apiKey:''}))}><option value="ollama">Ollama (native)</option><option value="openai-compatible">OpenAI-compatible</option></select></label>
+        <label>Name<input data-testid="assistant-profile-name" readOnly={draft.id === 'langvision-default-plan'} value={draft.displayName} onChange={event => setDraft({ ...draft, displayName: event.target.value })} /></label>
+        <label>Provider<select data-testid="assistant-profile-provider" value={draft.provider} onChange={event=>setDraft(current=>({...current,provider:event.target.value,baseUrlSource:'value',baseUrl:event.target.value==='openai-compatible'?'http://127.0.0.1:11434/v1/':'http://127.0.0.1:11434',expectedDigest:'',authMode:'none',apiKey:''}))}><option value="ollama">Ollama (native)</option><option value="openai-compatible">OpenAI-compatible</option></select></label>
         {draft.provider==='ollama'?<label>Endpoint<input data-testid="assistant-profile-endpoint" value={draft.baseUrl} onChange={event => setDraft({ ...draft, baseUrl: event.target.value })} /></label>:<ConnectionValueField config={draft} name="baseUrl" label="API base URL" testId="assistant-profile-endpoint" onChange={patch=>setDraft(current=>({...current,...patch}))} />}
         {draft.provider==='openai-compatible'&&<>
           <label>Authentication<select data-testid="assistant-profile-auth" value={draft.authMode} onChange={event=>setDraft(current=>({...current,authMode:event.target.value,apiKey:''}))}><option value="none">None (local endpoint)</option><option value="bearer">API key (Bearer)</option><option value="api-key">API key (api-key header)</option></select></label>
@@ -154,31 +174,35 @@ export function ProfileSettings({ workspaceId, initiallyOpen = false }: { worksp
           <label className="model-sampling-toggle"><input type="checkbox" checked={draft.sendSampling} onChange={event=>setDraft(current=>({...current,sendSampling:event.target.checked}))}/> Send temperature and seed</label>
         </>}
         <label>{draft.provider==='ollama'?'Find cached model':'Find available model'}<input type="search" aria-label="Find cached model" value={modelSearch} onChange={event=>setModelSearch(event.target.value)}/></label>
-        <label>{draft.provider==='ollama'?'Cached model':'Available models'}<select data-testid="assistant-profile-model" value={draft.model} onChange={event=>selectModel(event.target.value)}><option value={draft.model}>{draft.model}</option>{models.filter(model=>model.name!==draft.model&&model.name.toLowerCase().includes(modelSearch.toLowerCase())).map(model=><option key={model.name} value={model.name}>{model.name}{model.size?` / ${(model.size/1024**3).toFixed(1)} GiB`:''}</option>)}</select></label>
-        <label>Context<input data-testid="assistant-profile-context" type="number" value={draft.numCtx} onChange={event => setDraft({ ...draft, numCtx: Number(event.target.value) })} /></label>
-        <label>Request timeout (seconds)<input type="number" min={1} max={7200} value={draft.timeoutMs/1000} onChange={event=>setDraft(current=>({...current,timeoutMs:Number(event.target.value)*1000}))}/></label>
+        <label>{draft.provider==='ollama'?'Cached model':'Available models'}<select data-testid="assistant-profile-model" value={draft.model} onChange={event=>selectModel(event.target.value)}><option value={draft.model}>{draft.model || 'Select a model'}</option>{models.filter(model=>model.name!==draft.model&&model.name.toLowerCase().includes(modelSearch.toLowerCase())).map(model=><option key={model.name} value={model.name}>{model.name}{model.size?` / ${(model.size/1024**3).toFixed(1)} GiB`:''}</option>)}</select></label>
+        <label>Request timeout (seconds)<input type="number" min={1} max={7200} placeholder="Use server default" value={draft.timeoutMs == null ? '' : draft.timeoutMs / 1000} onChange={event=>setDraft(current=>({...current,timeoutMs:event.target.value === '' ? null : Number(event.target.value)*1000}))}/></label>
         {draft.provider==='ollama'&&<label>Thinking<select data-testid="assistant-profile-thinking" value={draft.thinkingMode} onChange={event => setDraft({ ...draft, thinkingMode: event.target.value, think: event.target.value !== "off" })}>{thinkingInvalid&&<option value={draft.thinkingMode}>{draft.thinkingMode} / unsupported by this model</option>}{thinkingModes.map(mode => <option key={mode} value={mode}>{mode}</option>)}</select></label>}
       </div>
       </fieldset>
-      <p>Thinking is shown separately in Historia after the call finishes, never as the answer or automatic context. Changes apply to future executions. Context size is unchanged when selecting a model.</p>
+      <p>Changes apply to future executions. Ollama uses the context configured on its model.</p>
       <p className="subtle-copy">{modelInfo?`Capabilities: ${modelInfo.capabilities.join(', ')||'not reported'}. ${modelInfo.thinking?'Thinking controls reported by Ollama.':'Thinking support is unknown; test this model before use.'}`:'Model capabilities unavailable; refresh models and test the connection.'}{modelInfo&&!modelInfo.capabilities.includes('tools')?' Native tool support is not confirmed.':''}</p>
       {thinkingInvalid&&<p role="status">Select a supported thinking mode before saving. This model may not permit thinking to be disabled.</p>}
       {draft.provider==='ollama'&&<><p className="subtle-copy">Pinned digest: <code>{draft.expectedDigest||'Not selected from cache'}</code></p>
       {cacheStatus.missing&&<p role="status">This model is no longer cached at this endpoint. Choose an installed model; no download will be attempted.</p>}
       {cacheStatus.digestChanged&&<p role="status">The cached tag now points to a different digest. <button type="button" onClick={()=>setDraft(current=>({...current,expectedDigest:cacheStatus.digest!}))}>Use refreshed digest</button></p>}
-      <fieldset className="creatio-settings-category"><legend>Cached GPT-OSS profiles</legend><p>Select an installed model; no download is attempted.</p><div className="assistant-profile-actions">{OLLAMA_MODEL_PRESETS.map(preset=><button type="button" className="ghost-button" key={preset.model} data-testid={`assistant-preset-${preset.numCtx}`} disabled={settingsBusy||!models.some(item=>item.name===preset.model&&item.digest)} onClick={()=>setDraft(current=>({...current,...cachedModelProfile(preset.model,models)}))}>{preset.label}</button>)}</div></fieldset></>}
+      </>}
       {draft.provider==='openai-compatible'&&<p className="subtle-copy">Use the API base URL including /v1/ or /openai/v1/. In Docker, localhost is the container; use host.docker.internal for Ollama on this computer. Model discovery may be unavailable: enter the deployment name directly. Context is a client budget, not a remote allocation. Reasoning controls depend on the server.</p>}
       <div className="assistant-profile-actions">
-        <button type="button" className="ghost-button" data-testid="assistant-profile-new" disabled={settingsBusy} onClick={() => setDraft(current => ({ ...current, id: undefined, displayName: 'New model connection', apiKey: '', expectedDigest: '' }))}>New profile</button>
+        <button type="button" className="ghost-button" data-testid="assistant-profile-new" disabled={settingsBusy} onClick={() => { setConfirmDelete(false); setSettingsError(''); setModelSearch(''); setDraft(current => ({ ...current, id: undefined, displayName: '', model: '', apiKey: '', expectedDigest: '', thinkingMode: 'off', think: false })); }}>New connection</button>
         <button type="button" className="ghost-button" data-testid="assistant-profile-discover" disabled={settingsBusy} onClick={() => void settingsAction(async () => {
           const generation = ++discoveryGeneration.current;
           const result = await assistantApi.discoverModels(draft.baseUrl,draft);
           if (generation === discoveryGeneration.current) {setModels(result.models);setModelsLoaded(true);}
         })}>Refresh models</button>
-        <button type="button" className="ghost-button" data-testid="assistant-profile-save" disabled={settingsBusy||(draft.provider==='ollama'&&(thinkingInvalid||cacheStatus.missing||cacheStatus.digestChanged))} onClick={() => void settingsAction(async()=>{await saveProfile({...draft,expectedUpdatedAt:draft.id===activeProfile?.id?activeProfile.updatedAt:undefined});setDraft(current=>({...current,apiKey:''}));})}>Save and select</button>
+        <button type="button" className="ghost-button" data-testid="assistant-profile-save" disabled={settingsBusy||!draft.displayName.trim()||!draft.model.trim()||(draft.provider==='ollama'&&(thinkingInvalid||cacheStatus.missing||cacheStatus.digestChanged))} onClick={() => void settingsAction(async()=>{const saved=await saveProfile({...draft,expectedUpdatedAt:selectedProfile?.updatedAt});editProfile(saved);})}>Save connection</button>
         <button type="button" className="ghost-button" disabled={settingsBusy} onClick={()=>{setDraft(current=>({...current,apiKey:''}));setCancelVersion(value=>value+1);setSettingsError('');}}>Cancel changes</button>
-        {activeProfile ? <button type="button" className="ghost-button" disabled={settingsBusy} onClick={() => void settingsAction(() => testProfile(activeProfile.id))}>Test connection</button> : null}
+        {selectedProfile && <button type="button" className="ghost-button" disabled={settingsBusy} onClick={() => void settingsAction(() => testProfile(selectedProfile.id))}>Test connection</button>}
+        {selectedProfile && selectedProfile.id !== activeProfile?.id && <button type="button" className="ghost-button" disabled={settingsBusy} onClick={() => void settingsAction(() => selectProfile(selectedProfile.id))}>Use as workspace profile</button>}
+        {selectedProfile && selectedProfile.id !== 'langvision-default-plan' && <button type="button" className="ghost-button" onClick={() => setConfirmDelete(true)}>Delete connection</button>}
       </div>
+      {confirmDelete && selectedProfile && <div role="group" aria-label="Confirm connection deletion"><p>Delete {selectedProfile.displayName}?</p><button onClick={() => setConfirmDelete(false)}>Keep connection</button><button disabled={settingsBusy} onClick={() => void settingsAction(async () => {
+        await deleteProfile(selectedProfile.id); editProfile(profiles.find(profile => profile.id === 'langvision-default-plan'));
+      })}>Confirm delete</button></div>}
       {activeProfile?.capability ? (
         <div className="assistant-profile-capability" data-testid="assistant-profile-capability"
           data-gpu-residency={activeProfile.capability.gpuResidency ?? 0}
@@ -240,7 +264,7 @@ export function AssistantPanel({
   compact = false,
   surfaceLabel,
   onClose,
-  onEditAgent
+  onEditAgent, onToggleExpanded, expanded
 }: Props) {
   const initialize = useAssistantStore(state => state.initialize);
   const conversation = useAssistantStore(state => state.conversation);
@@ -254,6 +278,14 @@ export function AssistantPanel({
   const clearConversation = useAssistantStore(state => state.clearConversation);
   const [confirmClear,setConfirmClear]=useState(false);
   const [input, setInput] = useState("");
+  const [modelActivity, setModelActivity] = useState<{ node: string; model: string; startedAt: number } | null>(null);
+  const [clock, setClock] = useState(Date.now);
+  useEffect(() => {
+    if (!modelActivity) return;
+    setClock(Date.now());
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [modelActivity]);
   const messagesRef = useRef<HTMLDivElement>(null);
   const messagesContentRef = useRef<HTMLDivElement>(null);
   const scrollFollower = useRef(createAssistantScrollFollower());
@@ -266,14 +298,16 @@ export function AssistantPanel({
     const id = conversation?.id;
     if (!id) return undefined;
     const events = new EventSource(`/api/assistant/conversations/${id}/events`);
-    const update = () => void refresh();
+    events.addEventListener('model-activity', event => setModelActivity(JSON.parse((event as MessageEvent).data).activity ?? null));
+    const update = () => void refresh().catch(() => {});
+    events.addEventListener('open', update);
     ["assistant-message", "tool-call", "tool-completed", "tool-failed", "approval-required", "clarification-required", "clarification-resolved", "task-plan-created", "task-updated", "task-needs-attention", "answer-synthesis-started", "generation-completed", "generation-failed", "generation-interrupted"].forEach(name => events.addEventListener(name, update));
     events.addEventListener("client-action", event => {
       const action = JSON.parse((event as MessageEvent).data).action;
       const debugBridge = (window as any).__chronoscope_debug;
       applyAssistantClientAction(action, debugBridge);
     });
-    return () => events.close();
+    return () => { events.close(); setModelActivity(null); };
   }, [conversation?.id, refresh]);
 
   const conversationItems = useMemo(() => assistantConversationItems(conversation), [conversation]);
@@ -305,7 +339,7 @@ export function AssistantPanel({
     await send(value, context);
   };
   const visibleSurface = surfaceLabel ?? surface;
-  const openHistoria = (actionId: string) => window.dispatchEvent(new CustomEvent("chronosql:open-historia", { detail: { actionId } }));
+  const openHistoria = (actionId: string, executionId?: string) => window.dispatchEvent(new CustomEvent("chronosql:open-historia", { detail: { actionId, executionId } }));
 
   return (
     <section className={`assistant-panel${compact ? " is-compact" : ""}`} data-testid={`assistant-panel-${surface}`}
@@ -315,6 +349,7 @@ export function AssistantPanel({
       <header>
         <div><Bot size={17} /><strong>Consilium AI Assistant</strong><span>{visibleSurface}</span></div>
         <div>
+          {onToggleExpanded && <button type="button" className="ghost-button lv-chat-expand" aria-label={expanded ? 'Restore chat width' : 'Expand chat'} onClick={onToggleExpanded}>{expanded ? <Minimize2 size={16}/> : <Maximize2 size={16}/>}</button>}
           {onEditAgent && <button type="button" className="ghost-button" data-testid="assistant-edit-agent" onClick={onEditAgent}><Settings2 size={14} /> Edit Agent</button>}
           <button type="button" className="ghost-button" data-testid="assistant-clear-chat" disabled={!canClearAssistantConversation(conversation,loading)} title="Clear chat after the agent finishes or is canceled" onClick={()=>setConfirmClear(true)}><Trash2 size={14}/> Clear chat</button>
           {loading ? <ActivityIndicator size={15} /> : null}
@@ -349,7 +384,7 @@ export function AssistantPanel({
                 <span className="assistant-task-status-icon" aria-label={task.label}>
                   {task.status === "completed" ? <Check size={13} />
                     : task.status === "failed" || task.status === "rejected" || task.status === "canceled" ? <X size={13} />
-                    : task.id === taskPlan.currentTaskId && (loading || conversation?.state==='generating') && ["active","executing","recovering","verifying"].includes(task.status) ? <ActivityIndicator size={13} />
+                    : conversation?.state==='generating' && task.id === taskPlan.currentTaskId && ["active","executing","recovering","verifying"].includes(task.status) ? <ActivityIndicator size={13} />
                         : <Circle size={11} />}
                 </span>
                 <div><strong>{task.title}</strong><span>{task.label}{task.activity ? ` / ${task.activity}` : ""}</span>
@@ -372,9 +407,10 @@ export function AssistantPanel({
             <div className="assistant-tool-activity-list">
               {item.actions.map((action: any) => (
                 <div key={action.actionId} className="assistant-tool-activity-item" data-action-id={action.actionId} data-tool-name={action.toolName} data-status={action.status}>
-                  <div><strong>{action.explanation}</strong><span>{action.toolName} / {action.status}</span></div>
+                  <div><strong>{action.explanation}</strong><span>{action.toolName} / {action.status}</span>
+                    {action.error && <p data-testid="assistant-tool-error">{action.error}</p>}</div>
                   {!action.actionId.startsWith("requested-") ? (
-                    <button type="button" data-testid="assistant-tool-historia-link" onClick={() => openHistoria(action.actionId)} title={`Open ${action.actionId} in Historia`} aria-label={`Open action ${action.actionId} in Historia`}>
+                    <button type="button" data-testid="assistant-tool-historia-link" onClick={() => openHistoria(action.actionId, item.message.payload?.userMessageId)} title={`Open ${action.actionId} in Historia`} aria-label={`Open action ${action.actionId} in Historia`}>
                       <Link2 size={13} /><code>{action.actionId}</code>
                     </button>
                   ) : null}
@@ -390,7 +426,12 @@ export function AssistantPanel({
             data-answer-validation={item.message.payload?.answerValidation ?? ""}
             data-answer-turn-id={item.message.payload?.turnId ?? ""}
             data-answer-evidence-count={item.message.payload?.evidenceCount ?? 0}>
-            <small>{item.message.payload?.messageKind === 'progress' ? 'Assistant update' : item.message.role}</small>
+            <small>{item.message.payload?.messageKind === 'node-status' ? item.message.payload.nodeLabel : item.message.payload?.messageKind === 'progress' ? 'Assistant update' : item.message.role}</small>
+            {item.message.payload?.messageKind === 'node-status' && <button type="button" className="ghost-button" onClick={() => window.dispatchEvent(new CustomEvent('chronosql:open-historia', { detail: { executionId: item.message.payload.userMessageId, attemptId: item.message.payload.nodeExecutionId } }))}>Inspect update</button>}
+            {item.message.payload?.messageKind === 'code-changes' && <details className="assistant-code-changes">
+              <summary>Code changes · {item.message.payload.changes.filter((change: any) => change.status === 'completed').length} of {item.message.payload.changes.length} complete</summary>
+              <ol>{item.message.payload.changes.map((change: any) => <li key={change.id}>{change.title} <small>{change.status}</small></li>)}</ol>
+            </details>}
             {item.message.payload?.providerThinking ? <details className="assistant-thinking" data-testid="assistant-thinking"><summary>Thinking...</summary><AssistantMarkdown>{item.message.payload.providerThinking}</AssistantMarkdown></details> : null}
             {item.message.role === "assistant"
               ? <AssistantMarkdown>{item.message.content}</AssistantMarkdown>
@@ -399,7 +440,7 @@ export function AssistantPanel({
         ))}
         {loading ? (
           <article className="assistant-message is-processing" data-testid="assistant-processing-state" aria-live="polite">
-            <ActivityIndicator size={15} /><div><strong>{presentation.processingTitle}</strong><span>{presentation.processingDetail}</span></div>
+            <ActivityIndicator size={15} /><div><strong>{modelActivity?.node ?? presentation.processingTitle}</strong><span data-testid="assistant-processing-detail">{modelActivity ? `${modelActivity.model} · ${Math.max(0, Math.floor((clock - modelActivity.startedAt) / 1000))}s elapsed` : presentation.processingDetail}</span></div>
           </article>
         ) : null}
         {!conversation?.messages?.length ? <div className="assistant-empty">Ask about the query, selected trace, or analytical canvas.</div> : null}
@@ -409,17 +450,20 @@ export function AssistantPanel({
         <section className="assistant-clarification" data-testid="assistant-clarification"
           data-clarification-id={conversation.clarification.id} data-round={conversation.clarification.round}>
           <AssistantMarkdown>{conversation.clarification.prompt}</AssistantMarkdown>
+          {conversation.clarification.presentation?.kind === 'clarification' && conversation.clarification.presentation.reason && <p><strong>Why I’m asking:</strong> {conversation.clarification.presentation.reason}</p>}
           {conversation.clarification.presentation?.kind === 'approval' && <div className="assistant-approval-explanation" data-testid="assistant-approval-explanation">
             <p><strong>Why:</strong> {conversation.clarification.presentation.reason}</p>
             <p><strong>Expected result:</strong> {conversation.clarification.presentation.expectedOutcome}</p>
             {conversation.clarification.presentation.repeatWarning && <p role="alert" data-testid="assistant-repeat-warning">{conversation.clarification.presentation.repeatWarning}</p>}
-            <ul>{conversation.clarification.presentation.actions.map((action:any)=><li key={action.requestId}><code>{action.name}</code>{action.repeated?' / repeats a successful action':''}</li>)}</ul>
+            <ul>{conversation.clarification.presentation.actions.map((action:any)=><li key={action.requestId}><code>{action.name}</code>{action.repeated?' / repeats a successful action':''}
+              {action.preview && <details open><summary>{action.preview.summary}</summary><pre style={{ maxHeight: 280, overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(action.preview, null, 2)}</pre></details>}
+            </li>)}</ul>
             <small>Only these exact prepared actions are approved. Full arguments and revision evidence are available in Historia.</small>
           </div>}
           {conversation.clarification.recommendation ? <p>Recommended: {conversation.clarification.recommendation}</p> : null}
           <div className="assistant-clarification-options">
             {conversation.clarification.options.map((option: string) => (
-              <button key={option} type="button" className="ghost-button" onClick={() => void clarify(conversation.clarification.id, option)}>{conversation.clarification.presentation?.kind==='approval'?(option==='approve'?'Approve actions':option==='deny'?'Do not approve':option):option}</button>
+              <button key={option} type="button" className="ghost-button" disabled={loading} onClick={() => void clarify(conversation.clarification.id, option)}>{conversation.clarification.presentation?.kind==='approval'?(option==='approve'?'Approve actions':option==='deny'?'Do not approve':option):option}</button>
             ))}
           </div>
           <label>{conversation.clarification.presentation?.kind==='approval'?'Feedback or alternative instructions (does not approve)':'Or clarify in your own words'}

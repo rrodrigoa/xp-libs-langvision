@@ -3,6 +3,45 @@ import { AUTHORING_INSTRUCTIONS, PRE_EXPRESSION_AUTHORING_INSTRUCTIONS } from '.
 import {RESEARCH_INSTRUCTIONS,WEB_TOOL_NAMES} from './agentResearch.js';
 import {TOOL_RECOVERY_INSTRUCTIONS} from './agentToolRecovery.js';
 export const PROGRESS_TOOL = 'agent.report_progress';
+export const CODE_CHANGES_TOOL = 'agent.report_changes';
+export function recordAppliedCodeChange(changes, changeId, evidenceReference) {
+  const index = changes?.findIndex(change => change.id === changeId && change.status === 'active');
+  if (index == null || index < 0 || !evidenceReference) return null;
+  const next = changes.findIndex((change, position) => position > index && change.status === 'pending');
+  return changes.map((change, position) => position === index ? { ...change, status: 'completed', evidenceReference } :
+    position === next ? { ...change, status: 'active' } : change);
+}
+export function validateCodeChangeSnapshot(changes, previous = [], observations = []) {
+  if (new Set(changes.map(change => change.id)).size !== changes.length) throw new Error('Use unique change IDs.');
+  const remaining = changes.filter(change => change.status === 'pending' || change.status === 'active');
+  if (remaining.length && (remaining[0].status !== 'active' || remaining.slice(1).some(change => change.status === 'active'))) {
+    throw new Error('Mark only the first remaining change active.');
+  }
+  const lastReport = observations.findLastIndex(item => item.success && item.name === CODE_CHANGES_TOOL);
+  const edit = observations.slice(lastReport + 1).find(item => item.success && item.name === 'workspace.edit' && !item.appliedCodeChanges);
+  const active = previous.find(change => change.status === 'active');
+  const sameChange = (before, after) => before.id === after.id && before.title === after.title;
+  for (const before of previous.filter(change => change.status === 'completed')) {
+    if (!changes.some(after => sameChange(before, after) && after.status === 'completed' && after.evidenceReference === before.evidenceReference)) throw new Error('Keep completed changes and their evidence unchanged.');
+  }
+  const completed = changes.filter(change => change.status === 'completed' && !previous.some(before => sameChange(before, change) && before.status === 'completed'));
+  if (edit ? completed.length !== 1 || !active || !sameChange(active, completed[0]) || ![edit.requestId, edit.toolCallId].filter(Boolean).includes(completed[0].evidenceReference) : completed.length) {
+    throw new Error('Complete only the active change and cite its successful workspace.edit request.');
+  }
+}
+export const CODE_CHANGES_CAPABILITY = {
+  name: CODE_CHANGES_TOOL, version: 1, risk: 'read',
+  description: 'Publish a separate in-chat snapshot of ordered code changes. Reuse IDs and report one active change at a time.',
+  schema: { type: 'object', additionalProperties: false, required: ['changes'], properties: {
+    changes: { type: 'array', minItems: 1, maxItems: 20, items: {
+      type: 'object', additionalProperties: false, required: ['id','title','status'], properties: {
+        id: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,80}$' }, title: { type: 'string', minLength: 1, maxLength: 300 },
+        status: { enum: ['pending','active','completed','blocked'] },
+        evidenceReference: { type: 'string' },
+      },
+    } },
+  } },
+};
 const INITIAL_PROGRESS_GUIDANCE = `Before acting on a request, call agent.report_progress with a short public summary and the distinct customer outcomes as tasks with stable IDs. Preparatory reads are steps, not separate customer outcomes. Report progress when evidence arrives, when a task changes, and before requesting a mutation. Keep completed tasks in the list. Reference real successful tool observations for completed outcomes. Include nextAction with exact name and arguments, reason, expectedOutcome and question before an approval-backed action. After a successful action, reuse its runId and results; do not repeat it unless the user actually requested repetition. If repetition is needed, explain why the previous result cannot be used. Use concise findings and next steps, never private chain-of-thought. Finish only when each outcome is completed or explicitly explained as blocked/canceled. Never use the user's question as proof of product state or compiler behavior. Workspace canvas generatedSql is authoring metadata, not compiler truth.`;
 const PREVIOUS_PROGRESS_GUIDANCE = `${INITIAL_PROGRESS_GUIDANCE}
 Call agent.report_progress as a native tool, using exactly its schema. Minimal initial arguments: {"summary":"I will inspect the selected input.","tasks":[{"id":"fields","title":"List observed input fields","status":"active"}]}. Do not add description to a task. Omit optional nextAction entirely when no approval-backed action is imminent; do not send null or a placeholder action. After a successful observation, update the SAME task ID using {"summary":"The input fields are available.","tasks":[{"id":"fields","title":"List observed input fields","status":"completed","evidenceReferences":["ACTUAL_SUCCESSFUL_REQUEST_ID"]}]}, replacing the placeholder with the observation's real requestId. For an unavailable outcome use status blocked and a reason explaining the actual failure. Then call finish_step separately. Its evidenceReferences are an array of actual request ID strings, not objects.`;

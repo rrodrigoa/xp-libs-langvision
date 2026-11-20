@@ -86,8 +86,15 @@ export function validatePrimitiveAgent(definition) {
       if (typeof edge.name !== 'string' || !edge.name.trim()) fail(`Action '${edge.id}' needs a display name.`);
       if (edge.kind !== undefined && !['success', 'error', 'tools', 'result', 'approval'].includes(edge.kind)) fail(`Action '${edge.id}' has an unsupported branch kind.`);
       if (edge.evidencePolicy !== undefined && !['optional', 'required'].includes(edge.evidencePolicy)) fail(`Action '${edge.id}' has an unsupported evidence policy.`);
+      if (edge.availableWhen !== undefined && (!primitivePath(edge.availableWhen?.path) || !/^(input|context)\./.test(edge.availableWhen.path) ||
+        !['present', 'missing'].includes(edge.availableWhen.operator) || !graph.nodes.some(node => node.id === edge.source && node.handler === 'llm' && node.operationVersion === 2) ||
+        ['error', 'tools', 'approval', 'result'].includes(edge.kind))) fail(`Action '${edge.id}' needs a native model exit and a present or missing input/context path.`);
       if (edge.resultSchema) errors.push(...validateAgentSchema(edge.resultSchema, null, true).map(error => `${key}: ${edge.id}: ${error}`));
-      if (edge.evidenceChecks !== undefined && (!Array.isArray(edge.evidenceChecks) || edge.evidenceChecks.some(contract => typeof contract.toolName !== 'string' || !Array.isArray(contract.checks) || !contract.checks.length || contract.checks.some(check => !primitivePath(check.path) || !['equals', 'present', 'nonempty', 'includes', 'none-match'].includes(check.operator) || check.expectedPath !== undefined && !primitivePath(check.expectedPath) || check.operator === 'none-match' && (!primitivePath(check.field) || !Array.isArray(check.values)))))) fail(`Action '${edge.id}' has invalid evidence checks.`);
+      const invalidChecks = checks => !Array.isArray(checks) || checks.some(contract => !contract || typeof contract.toolName !== 'string' || !Array.isArray(contract.checks) || !contract.checks.length || contract.checks.some(check => !check || !primitivePath(check.path) || !['equals', 'present', 'nonempty', 'includes', 'none-match'].includes(check.operator) || check.expectedPath !== undefined && !primitivePath(check.expectedPath) || check.operator === 'none-match' && (!primitivePath(check.field) || !Array.isArray(check.values))));
+      if (edge.evidenceChecks !== undefined && invalidChecks(edge.evidenceChecks)) fail(`Action '${edge.id}' has invalid evidence checks.`);
+      if (edge.evidenceAlternatives !== undefined && (!Array.isArray(edge.evidenceAlternatives) || edge.evidenceAlternatives.length < 2 ||
+        edge.evidenceAlternatives.some(alternative => !alternative || typeof alternative.label !== 'string' || !alternative.label.trim() ||
+          invalidChecks(alternative.checks) || !alternative.checks.length || alternative.checks.some(check => check.whenObserved)))) fail(`Action '${edge.id}' has invalid evidence alternatives. Each path needs a label and unconditional checks.`);
     }
     for (const node of graph.nodes) {
       const prefix = `${node.id}: `, s = node.settings;
@@ -101,12 +108,20 @@ export function validatePrimitiveAgent(definition) {
         return own(binding, 'fields') && binding.fields && typeof binding.fields === 'object' && !Array.isArray(binding.fields) && Object.entries(binding.fields).every(([key, b]) => primitivePath(key) && !key.includes('.') && checkBinding(b));
       };
       if (!s || !checkBinding(s.input)) { fail(`${prefix}An explicit input binding is required.`); continue; }
-      const commonSettings = ['input', 'outputMode', 'errorOutputMode', 'outputs', 'actionPath', ...(node.handler==='llm' && node.operationVersion===2?['authoringInstructions','maxNoProgressCalls','researchInstructions','planExemptTools','toolContractInstructions']:[])];
-      const operationSettings = { start: [], llm: ['systemPrompt', 'responseSchema', 'toolNames', 'profileId', ...(node.operationVersion === 2 ? ['purpose', 'inputSchema', 'context', 'maxModelCalls', 'maxRepeatedCalls', 'protocolInstructions', 'maxOutputTokens', 'progressInstructions', 'historyInstructions', 'requirePlan'] : [])], tool: ['mode', 'requestsPath', 'toolNames', 'approvalRisks'], data: ['operations'], human: ['kind', 'requestsPath', 'prompt', 'promptPath', 'optionsPath', 'questionMode', 'questionInstructions', 'profileId'], workflow: ['workflowRef', 'returnEvidence'], end: ['mode', 'responsePath', 'terminalStatus'] }[node.handler] ?? [];
+      const commonSettings = ['input', 'outputMode', 'errorOutputMode', 'outputs', 'actionPath', 'statusMessages', ...(node.handler==='llm' && node.operationVersion===2?['authoringInstructions','maxNoProgressCalls','researchInstructions','planExemptTools','toolContractInstructions','skillIds','instructionSkillIds']:[])];
+      if (s.statusMessages !== undefined && (!s.statusMessages || typeof s.statusMessages !== 'object' || Array.isArray(s.statusMessages) ||
+        Object.entries(s.statusMessages).some(([phase, binding]) => !['start', 'success', 'failure'].includes(phase) || !checkBinding(binding)))) fail(`${prefix}Chat status messages need start, success or failure bindings.`);
+      const operationSettings = { start: [], llm: ['systemPrompt', 'responseSchema', 'toolNames', 'profileId', ...(node.operationVersion === 2 ? ['purpose', 'inputSchema', 'context', 'maxModelCalls', 'maxRepeatedCalls', 'protocolInstructions', 'maxOutputTokens', 'progressInstructions', 'historyInstructions', 'requirePlan'] : [])], tool: ['mode', 'requestsPath', 'toolNames', 'approvalRisks'], data: ['operations'], human: ['kind', 'requestsPath', 'prompt', 'promptPath', 'optionsPath', 'recommendationPath', 'reasonPath', 'questionMode', 'questionInstructions', 'profileId'], workflow: ['workflowRef', 'returnEvidence'], end: ['mode', 'responsePath', 'terminalStatus'] }[node.handler] ?? [];
       for (const key of Object.keys(s)) if (![...commonSettings, ...operationSettings].includes(key)) fail(`${prefix}Unsupported setting '${key}' is not consumed by this operation.`);
       if (s.requirePlan !== undefined && (typeof s.requirePlan !== 'boolean' || s.requirePlan && !s.toolNames?.includes('agent.report_progress'))) fail(`${prefix}A required plan needs agent.report_progress availability.`);
       if (s.progressInstructions !== undefined && typeof s.progressInstructions !== 'string') fail(`${prefix}Progress instructions must be text.`);
       if (s.historyInstructions !== undefined && typeof s.historyInstructions !== 'string') fail(`${prefix}History instructions must be text.`);
+      if (s.skillIds !== undefined && (!Array.isArray(s.skillIds) || new Set(s.skillIds).size !== s.skillIds.length ||
+        s.skillIds.some(id => typeof id !== 'string' || !Array.isArray(definition.resources?.skills) || !definition.resources.skills.some(skill => skill?.id === id)))) {
+        fail(`${prefix}Select unique skill IDs from the agent's saved resources.`);
+      }
+      if (s.instructionSkillIds !== undefined && (!Array.isArray(s.instructionSkillIds) || new Set(s.instructionSkillIds).size !== s.instructionSkillIds.length ||
+        s.instructionSkillIds.some(id => !definition.resources?.skills?.some(skill => skill.id === id) || Array.isArray(s.skillIds) && !s.skillIds.includes(id)))) fail(`${prefix}Instruction skills must be unique and attached to this node.`);
       if (s.authoringInstructions !== undefined && typeof s.authoringInstructions !== 'string') fail(`${prefix}Authoring instructions must be text.`);
       if(s.researchInstructions!==undefined&&typeof s.researchInstructions!=='string')fail(`${prefix}Research instructions must be text.`);
       if(s.toolContractInstructions!==undefined&&typeof s.toolContractInstructions!=='string')fail(`${prefix}Tool contract instructions must be text.`);

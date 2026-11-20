@@ -5,6 +5,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { starterPrimitiveAgent } from '../shared/primitiveAgentStarter.js';
+import { modelTimeoutMs } from './assistantDeadlines.js';
+import { addApproachPlanning, addCodeChangePlanner, addTerminalCodingTools, addTerminalVerification, codingAgent, configureCodingGuidance, migrateInstructionSkills } from '../shared/codingAgent.js';
 import { encryptModelSecret, decryptModelSecret, validateModelConnection } from './modelConnection.js';
 
 let assistantDb = null;
@@ -339,6 +341,8 @@ export function saveAiProfile(profile) {
   const db = getDb();
   const timestamp = now();
   const profileId = profile.id || id("profile");
+  if (profileId === 'langvision-default-plan') profile = { ...profile, displayName: 'Default' };
+  else if (String(profile.displayName ?? '').trim().toLowerCase() === 'default') throw Object.assign(new Error('Default is reserved for the built-in profile.'), { status: 409 });
   const previous = getAiProfile(profileId);
   const connection = validateModelConnection(profile);
   if (previous && profile.expectedUpdatedAt && previous.updatedAt !== profile.expectedUpdatedAt) throw Object.assign(new Error('Profile changed. Reload before saving.'), { status: 409 });
@@ -367,7 +371,7 @@ export function saveAiProfile(profile) {
     profile.displayName || "Local Ollama",
     profile.baseUrl,
     profile.model,
-    profile.timeoutMs ?? 120000,
+    modelTimeoutMs(profile),
     profile.maxConcurrency ?? 1,
     profile.numCtx ?? 16384,
     profile.temperature ?? 0,
@@ -397,6 +401,13 @@ export function modelConnectionForProfile(profile) {
 
 export function deleteAiProfile(profileId) {
   const db = getDb();
+  if (profileId === 'langvision-default-plan') throw Object.assign(new Error('The Default connection cannot be deleted.'), { status: 409 });
+  const references = definition => [definition, definition.queryTranslation, definition.executionWorkflow, definition.synthesisWorkflow].some(graph =>
+    graph && (graph.profileId === profileId || graph.nodes?.some(node => node.settings?.profileId === profileId)));
+  const inUse = db.prepare(`SELECT definition_json FROM ai_workflow_drafts
+    UNION ALL SELECT v.definition_json FROM workspace_ai_workflow_revisions p JOIN ai_workflow_versions v ON v.workflow_id=p.workflow_id AND v.version=p.version
+    UNION ALL SELECT definition_json FROM ai_workflow_definitions`).all().some(row => references(JSON.parse(row.definition_json)));
+  if (inUse) throw Object.assign(new Error('This connection is referenced by an agent or draft. Reassign its model settings before deleting it.'), { status: 409 });
   db.prepare("UPDATE workspace_ai_settings SET profile_id = NULL WHERE profile_id = ?").run(profileId);
   return db.prepare("DELETE FROM ai_profiles WHERE profile_id = ?").run(profileId).changes > 0;
 }
@@ -1178,6 +1189,136 @@ export function activeAssistantWorkflow(workspaceId = 'default') {
   const live=getDb().prepare(`SELECT v.* FROM ai_workflow_versions v LEFT JOIN ai_workflow_version_labels l USING(workflow_id,version)
     WHERE v.workflow_id=? AND COALESCE(l.deleted,0)=0 ORDER BY v.version DESC LIMIT 1`).get(candidate.id);
   return live?{id:live.workflow_id,version:live.version,definition:JSON.parse(live.definition_json),updatedAt:live.updated_at}:candidate;
+}
+
+export function provisionLocalCodingAgent(env = process.env, { terminal = false } = {}) {
+  ensureAgentLifecycle();
+  const db = getDb();
+  db.transaction(() => {
+    const workflowId = 'langvision-coding-agent';
+    const current = db.prepare("SELECT workflow_id FROM ai_system_agents WHERE role='consilium'").get();
+    const seeded = db.prepare("SELECT 1 FROM ai_system_agents WHERE role='coding-profiles-v2'").get();
+    const baseUrl = env.LANGVISION_OLLAMA_URL || 'http://127.0.0.1:11434';
+    if (!seeded) {
+      const previous = getAiProfile('langvision-default-plan');
+      saveAiProfile({ id: 'langvision-default-plan', displayName: 'Default', baseUrl: previous?.baseUrl || baseUrl,
+        model: env.LANGVISION_PLANNER_MODEL || 'gpt-oss-120b-32k:latest', thinkingMode: env.LANGVISION_PLANNER_THINKING || 'medium' });
+      if (!getAiProfile('langvision-default-code') || current?.workflow_id === workflowId) saveAiProfile({
+        id: 'langvision-default-code', displayName: 'Coding', baseUrl,
+        model: env.LANGVISION_CODER_MODEL || 'qwen3-coder-next:q4_K_M',
+      });
+      db.prepare("INSERT INTO ai_system_agents VALUES ('coding-profiles-v2',?)").run(workflowId);
+    }
+    const configureProfiles = definition => {
+      definition.profileId = 'langvision-default-plan';
+      for (const node of definition.nodes) if (node.handler === 'llm' || (node.handler === 'human' && node.settings.questionMode === 'model')) {
+        node.settings.profileId = ['reason', 'verify'].includes(node.id) ? 'langvision-default-code' : 'langvision-default-plan';
+      }
+    };
+    if (current?.workflow_id === workflowId) {
+      const saved = db.prepare('SELECT * FROM ai_workflow_definitions WHERE workflow_id=?').get(workflowId);
+      const addResearch = definition => {
+        let changed = false;
+        for (const node of definition.nodes.filter(node => ['reason', 'verify', 'tools', 'verify_tools'].includes(node.id) && Array.isArray(node.settings?.toolNames))) {
+          for (const name of ['web.fetch', 'web.search']) if (!node.settings.toolNames.includes(name)) {
+            node.settings.toolNames.push(name); changed = true;
+          }
+        }
+        for (const node of definition.nodes.filter(node => node.handler === 'llm' && ['plan', 'verify'].includes(node.id))) {
+          const guidance = node.id === 'plan' ? 'Plan only requested outcomes and essential verification; do not add unrelated lint or documentation.' :
+            'Before answering, inspect the full task checklist. Remove unrequested outcomes with planChangeReason, or report real evidence or a concrete blockage for each.';
+          if (typeof node.settings?.systemPrompt === 'string' && !node.settings.systemPrompt.includes(guidance)) {
+            node.settings.systemPrompt += '\n\n' + guidance; changed = true;
+          }
+        }
+        return changed;
+      };
+      const migrated = db.prepare('SELECT 1 FROM ai_system_agents WHERE role=?').get('coding-research-v1');
+      if (saved && !migrated) {
+        const definition = JSON.parse(saved.definition_json);
+        if (addResearch(definition)) {
+          const updated = saveAssistantWorkflow(workflowId, definition, saved.version);
+          db.prepare('UPDATE workspace_ai_workflow_revisions SET version=? WHERE workflow_id=? AND version=?').run(updated.version, workflowId, saved.version);
+        }
+        const draft = db.prepare('SELECT * FROM ai_workflow_drafts WHERE workflow_id=?').get(workflowId);
+        if (draft) {
+          const definition = JSON.parse(draft.definition_json);
+          if (addResearch(definition)) saveAssistantWorkflowDraft(workflowId, definition, draft.revision);
+        }
+        db.prepare('INSERT INTO ai_system_agents VALUES (?,?)').run('coding-research-v1', workflowId);
+      }
+      if (saved && !seeded) {
+        const latest = db.prepare('SELECT * FROM ai_workflow_definitions WHERE workflow_id=?').get(workflowId);
+        const definition = JSON.parse(latest.definition_json);
+        addCodeChangePlanner(definition);
+        configureProfiles(definition);
+        const updated = saveAssistantWorkflow(workflowId, definition, latest.version);
+        db.prepare('UPDATE workspace_ai_workflow_revisions SET version=? WHERE workflow_id=?').run(updated.version, workflowId);
+        const draft = db.prepare('SELECT * FROM ai_workflow_drafts WHERE workflow_id=?').get(workflowId);
+        if (draft) {
+          const editable = JSON.parse(draft.definition_json);
+          addCodeChangePlanner(editable);
+          configureProfiles(editable);
+          saveAssistantWorkflowDraft(workflowId, editable, draft.revision);
+        }
+        try { deleteAiProfile('langvision-default-inspect'); } catch (error) { if (error.status !== 409) throw error; }
+      }
+      if (saved && terminal && !db.prepare("SELECT 1 FROM ai_system_agents WHERE role='coding-terminal-verification-v5'").get()) {
+        const latest = db.prepare('SELECT * FROM ai_workflow_definitions WHERE workflow_id=?').get(workflowId);
+        const definition = JSON.parse(latest.definition_json);
+        if (addTerminalCodingTools(definition) || addTerminalVerification(definition)) {
+          const updated = saveAssistantWorkflow(workflowId, definition, latest.version);
+          db.prepare('UPDATE workspace_ai_workflow_revisions SET version=? WHERE workflow_id=? AND version=?').run(updated.version, workflowId, latest.version);
+        }
+        const draft = db.prepare('SELECT * FROM ai_workflow_drafts WHERE workflow_id=?').get(workflowId);
+        if (draft) {
+          const definition = JSON.parse(draft.definition_json);
+          if (addTerminalCodingTools(definition) || addTerminalVerification(definition)) saveAssistantWorkflowDraft(workflowId, definition, draft.revision);
+        }
+        db.prepare("INSERT INTO ai_system_agents VALUES ('coding-terminal-verification-v5',?)").run(workflowId);
+      }
+      if (saved && !db.prepare("SELECT 1 FROM ai_system_agents WHERE role='coding-guidance-v1'").get()) {
+        const latest = db.prepare('SELECT * FROM ai_workflow_definitions WHERE workflow_id=?').get(workflowId);
+        const definition = JSON.parse(latest.definition_json);
+        if (configureCodingGuidance(definition)) {
+          const updated = saveAssistantWorkflow(workflowId, definition, latest.version);
+          db.prepare('UPDATE workspace_ai_workflow_revisions SET version=? WHERE workflow_id=? AND version=?').run(updated.version, workflowId, latest.version);
+        }
+        const draft = db.prepare('SELECT * FROM ai_workflow_drafts WHERE workflow_id=?').get(workflowId);
+        if (draft) {
+          const editable = JSON.parse(draft.definition_json);
+          if (configureCodingGuidance(editable)) saveAssistantWorkflowDraft(workflowId, editable, draft.revision);
+        }
+        db.prepare("INSERT INTO ai_system_agents VALUES ('coding-guidance-v1',?)").run(workflowId);
+      }
+      if (saved && !db.prepare("SELECT 1 FROM ai_system_agents WHERE role='coding-approach-draft-v1'").get()) {
+        const existingDraft = db.prepare('SELECT 1 FROM ai_workflow_drafts WHERE workflow_id=?').get(workflowId);
+        if (!existingDraft) {
+          const currentDefinition = JSON.parse(db.prepare('SELECT definition_json FROM ai_workflow_definitions WHERE workflow_id=?').get(workflowId).definition_json);
+          if (addApproachPlanning(currentDefinition)) {
+            migrateInstructionSkills(currentDefinition);
+            saveAssistantWorkflowDraft(workflowId, currentDefinition, 0);
+            db.prepare("INSERT INTO ai_system_agents VALUES ('coding-approach-draft-v1',?)").run(workflowId);
+          }
+        }
+      }
+      return;
+    }
+    const definition = codingAgent();
+    if (terminal) {
+      addTerminalCodingTools(definition);
+      db.prepare("INSERT OR IGNORE INTO ai_system_agents VALUES ('coding-terminal-verification-v5',?)").run(workflowId);
+    }
+    configureProfiles(definition);
+    if (!db.prepare('SELECT 1 FROM ai_workflow_definitions WHERE workflow_id=?').get(workflowId)) saveAssistantWorkflow(workflowId, definition, 0);
+    db.prepare("UPDATE ai_system_agents SET workflow_id=? WHERE role='consilium'").run(workflowId);
+    db.prepare('INSERT OR IGNORE INTO ai_system_agents VALUES (?,?)').run('coding-research-v1', workflowId);
+    db.prepare("INSERT OR IGNORE INTO ai_system_agents VALUES ('coding-approach-draft-v1',?)").run(workflowId);
+    for (const table of ['workspace_ai_workflows', 'workspace_ai_workflow_revisions']) {
+      db.prepare(`DELETE FROM ${table} WHERE workspace_id='default' AND workflow_id=?`).run('consilium-primitive');
+    }
+    if (!db.prepare('SELECT 1 FROM workspace_ai_settings WHERE workspace_id=?').get('default')) selectWorkspaceAiProfile('default', definition.profileId);
+  })();
 }
 
 export function publishAssistantBootstrap(workspaceId, previous, definition) {

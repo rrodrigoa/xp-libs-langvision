@@ -14,9 +14,10 @@ const read = async (path, method = 'GET', value) => {
   if (!response.ok) throw new Error(payload.error ?? 'Request failed.');
   return payload;
 };
-function Historia() {
+function Historia({ target }) {
   const [entries, setEntries] = useState([]), [cursor, setCursor] = useState(null);
-  const [selected, setSelected] = useState(null), [error, setError] = useState('');
+  const [selected, setSelected] = useState(target?.executionId ?? null), [error, setError] = useState('');
+  const [copied, setCopied] = useState('');
   async function load(after = null) {
     try {
       const result = await read('/api/assistant/executions?workspaceId=default' + (after ? '&cursor=' + encodeURIComponent(after) : ''));
@@ -32,7 +33,13 @@ function Historia() {
       <aside aria-label="Agent turns">{entries.map(entry => <button type="button" key={entry.id} aria-pressed={selected === entry.actionId}
         onClick={() => setSelected(entry.actionId)}><strong>{entry.title}</strong><small>{entry.status} · {entry.createdAt}</small></button>)}
         {cursor && <button onClick={() => load(cursor)}>Load older turns</button>}{!entries.length && <p>No agent turns yet.</p>}</aside>
-      <article>{selected && <AgentExecutionTrace key={selected} workspaceId={workspaceId} actionId={selected} />}</article>
+      <article>{selected && <><header className="workspace-toolbar">
+        <label>Run ID <input aria-label="Run ID" readOnly value={selected} onFocus={event => event.target.select()} /></label>
+        <button onClick={async () => {
+          try { await navigator.clipboard.writeText(selected); setCopied(selected); }
+          catch { setCopied(''); setError('Clipboard unavailable. Select the Run ID and copy it manually.'); }
+        }}>{copied === selected ? 'Copied' : 'Copy run ID'}</button>
+      </header><AgentExecutionTrace key={selected} workspaceId={workspaceId} actionId={selected} initialSelection={selected === target?.executionId ? target : undefined} /></>}</article>
     </HistoriaSplit>
   </section>;
 }
@@ -75,12 +82,17 @@ function Packages({ onImported }) {
     <p>Export the graph and non-secret resources as one file. Imports create inactive drafts with disabled MCP endpoints.</p>
     <label>Agent<select value={selected} onChange={event => setSelected(event.target.value)}>
       {agents.map(item => <option key={item.id} value={item.id}>{item.definition.name}</option>)}</select></label>
-    {selected && <a download href={'/api/agent-packages/' + encodeURIComponent(selected)}>Download agent package</a>}
-    <label>Import package<input type="file" accept=".json,application/json" onChange={async event => {
+    {selected && <a download href={'/api/agent-packages/' + encodeURIComponent(selected)}>Download agent ZIP</a>}
+    <label>Import package<input type="file" accept=".zip,.json,application/zip,application/json" onChange={async event => {
       const file = event.target.files[0]; if (!file) return;
       try {
         if (file.size > 4 * 1024 * 1024) throw new Error('Package exceeds the 4 MiB limit.');
-        const result = await read('/api/agent-packages', 'POST', JSON.parse(await file.text()));
+        let result;
+        if (/\.zip$/i.test(file.name)) {
+          const response = await fetch('/api/agent-packages', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: file });
+          result = await response.json();
+          if (!response.ok) throw new Error(result.error ?? 'Import failed.');
+        } else result = await read('/api/agent-packages', 'POST', JSON.parse(await file.text()));
         setStatus('Draft imported. Bind a local model and enable only trusted MCP endpoints before activation.');
         onImported(result.id);
       } catch (error) { setStatus(error.message); }
@@ -88,28 +100,87 @@ function Packages({ onImported }) {
     }} /></label><p role="status">{status}</p>
   </section>;
 }
+function CodingWorkspace() {
+  const [folder, setFolder] = useState(''), [write, setWrite] = useState(false);
+  const [terminal, setTerminal] = useState(false);
+  const [grant, setGrant] = useState(null), [error, setError] = useState('');
+  const [tools, setTools] = useState([]);
+  useEffect(() => {
+    read('/api/coding-workspace').then(setGrant).catch(error => setError(error.message));
+    read('/api/coding-workspace/tools').then(setTools).catch(error => setError(error.message));
+  }, []);
+  async function change(revoke) {
+    setError('');
+    try {
+      setGrant(await read(revoke ? '/api/coding-workspace/revoke' : '/api/coding-workspace', revoke ? 'POST' : 'PUT', revoke ? {} : { path: folder, write, terminal }));
+    } catch (error) { setError(error.message); }
+  }
+  return <section className="lv-settings"><h2>Coding Workspace</h2>
+    <p>Choose a dedicated project folder on this computer. Access lasts one hour or until revoked. Edits and commands still need separate approval.</p>
+    <label>Local folder<input value={folder} onChange={event => setFolder(event.target.value)} /></label>
+    <label><input type="checkbox" checked={write} onChange={event => setWrite(event.target.checked)} /> Allow the agent to request file edits</label>
+    {grant?.terminalAvailable && <><label><input type="checkbox" checked={terminal} onChange={event => setTerminal(event.target.checked)} /> Allow agent-controlled PowerShell</label>
+      <p>Each terminal needs one approval. After that the agent can type arbitrary commands as your Windows account. The project folder is a starting location, not a sandbox. Do not enter credentials.</p></>}
+    <div className="lv-actions"><button disabled={!folder.trim()} onClick={() => change(false)}>Grant access</button>
+      <button disabled={!grant?.granted} onClick={() => change(true)}>Revoke access</button></div>
+    {error && <p role="alert">{error}</p>}
+    <p role="status">{grant?.granted ? (grant.write ? 'Read and propose edits: ' : 'Read only: ') + grant.root : 'No folder granted.'}</p>
+    {grant?.terminal && <p>Agent-controlled PowerShell is enabled for this grant.</p>}
+    <h3>Built-in coding tools</h3>
+    <p>These run inside LangVision. No MCP server is needed for local project work. Optional external tools are configured under MCP connections.</p>
+    {tools.map(tool => <details key={tool.name}><summary><code>{tool.name}</code> · {tool.risk === 'read' ? 'Read only' : tool.risk === 'navigate' ? 'Approved session required' : 'Approval required'}</summary>
+      <p>{tool.description}</p><pre>{JSON.stringify(tool.schema, null, 2)}</pre>
+    </details>)}
+  </section>;
+}
 function App() {
   const [tab, setTab] = useState('Agent Editor'), [chat, setChat] = useState(true);
   const [inspection, setInspection] = useState(null), [revision, setRevision] = useState(0);
+  const [historyTarget, setHistoryTarget] = useState(null);
+  const [expanded, setExpanded] = useState(false), [chatWidth, setChatWidth] = useState(32);
   const updated = () => setRevision(value => value + 1);
   useEffect(() => {
     const inspect = event => { setInspection(event.detail); setTab('Agent Editor'); };
     window.addEventListener('consilium-inspect-execution', inspect);
-    return () => window.removeEventListener('consilium-inspect-execution', inspect);
+    const history = async event => {
+      const { actionId, executionId, attemptId } = event.detail;
+      try { setHistoryTarget(actionId ? await read('/api/assistant/historia-link/' + encodeURIComponent(actionId)) : { executionId, attemptId }); }
+      catch { setHistoryTarget(executionId ? { executionId } : null); }
+      setExpanded(false); setTab('Historia');
+    };
+    window.addEventListener('chronosql:open-historia', history);
+    return () => {
+      window.removeEventListener('consilium-inspect-execution', inspect);
+      window.removeEventListener('chronosql:open-historia', history);
+    };
   }, []);
   return <main className="lv-shell"><header className="lv-header"><h1>LangVision</h1>
-    <nav aria-label="Workspace">{['Agent Editor', 'Historia', 'MCP connections', 'Packages'].map(item => <button key={item}
+    <nav aria-label="Workspace">{['Agent Editor', 'Historia', 'MCP connections', 'Packages', 'Coding Workspace'].map(item => <button key={item}
       aria-pressed={tab === item} onClick={() => { setTab(item); setInspection(null); }}>{item}</button>)}</nav>
     <button onClick={() => setChat(value => !value)} aria-expanded={chat}>Agent chat</button></header>
-    <div className={chat ? 'lv-content lv-with-chat' : 'lv-content'}>
+    <div className={chat ? 'lv-content lv-with-chat' + (expanded ? ' lv-chat-expanded' : '') : 'lv-content'} style={{ '--lv-chat-width': chatWidth + '%' }}>
       <div className="lv-workspace">
         {tab === 'Agent Editor' && <AgentDesigner key={revision} workspaceId={workspaceId} inspection={inspection}
           onInspectionClose={() => setInspection(null)} onClose={() => setTab('Historia')} />}
-        {tab === 'Historia' && <Historia />}
+        {tab === 'Historia' && <Historia key={historyTarget?.attemptId ?? historyTarget?.executionId ?? 'recent'} target={historyTarget} />}
         {tab === 'MCP connections' && <Connections onUpdated={updated} />}
+        {tab === 'Coding Workspace' && <CodingWorkspace />}
         {tab === 'Packages' && <Packages onImported={id => { localStorage.setItem('consilium-designer-default', id); updated(); }} />}
       </div>
+      {chat && !expanded && <div className="lv-chat-divider" role="separator" aria-label="Resize agent chat" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={65} aria-valuenow={Math.round(chatWidth)} tabIndex={0}
+        onPointerDown={event => { if (event.button === 0) event.currentTarget.setPointerCapture(event.pointerId); }}
+        onPointerMove={event => {
+          if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+          const bounds = event.currentTarget.parentElement.getBoundingClientRect();
+          setChatWidth(Math.max(25, Math.min(65, (bounds.right - event.clientX) / bounds.width * 100)));
+        }}
+        onKeyDown={event => {
+          if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
+          event.preventDefault();
+          setChatWidth(value => event.key === 'Home' ? 50 : Math.max(25, Math.min(65, value + (event.key === 'ArrowLeft' ? 2 : -2))));
+        }}/>}
       <aside className="lv-chat" hidden={!chat}><AssistantPanel workspaceId={workspaceId} surface="ai" context={{}}
+        expanded={expanded} onToggleExpanded={() => setExpanded(value => !value)}
         allowProfileAdmin onClose={() => setChat(false)} onEditAgent={() => { setInspection(null); setTab('Agent Editor'); }} /></aside>
     </div>
   </main>;

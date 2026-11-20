@@ -1,0 +1,36 @@
+name: Windows interactive terminal
+on: [push, pull_request]
+jobs:
+  conpty:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: standalone/package-lock.json
+      - run: npm ci --prefix standalone
+      - run: npm run build --prefix standalone
+      - name: Git prompt behavior in PowerShell 7 and 5.1
+        run: |
+          pwsh -NoProfile -File examples/coding-agent/GitPrompt.test.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File examples/coding-agent/GitPrompt.test.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: JavaScript syntax check
+        run: |
+          Get-ChildItem standalone/server/windowsTerminal*.js | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Unit tests and real ConPTY acceptance
+        run: |
+          $env:LANGVISION_TEST_CONPTY='1'
+          $env:LANGVISION_PWSH_PATH=(Get-Command pwsh.exe).Source
+          node --experimental-test-coverage --test-coverage-include="**/server/windowsTerminal.js" --test-coverage-lines=90 --test standalone/server/windowsTerminal.test.js standalone/server/windowsTerminalAgent.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm test
+      - name: Browser Git prompt workflow
+        run: node standalone/tests/git-prompt-site.mjs
